@@ -25,6 +25,8 @@ shared source of truth.
 
 See [architecture](docs/architecture.md), [security](docs/security.md),
 [API](docs/api.md), and [operations](docs/operations.md) for the full contract.
+Agents integrating with Jaybase should use [llm.md](llm.md) as their operating
+contract.
 
 ## Deploy in five steps
 
