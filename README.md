@@ -1,35 +1,109 @@
 # Jaybase
 
-Jaybase is an AI-native information base for replayable, tamper-evident event storage.
+Jaybase is a hostable, AI-native information base for replayable,
+tamper-evident business facts. It stores an append-only chain of encrypted JSON
+events and exposes that chain through a small authenticated HTTP API.
 
-It was extracted from Magpie as a standalone storage project.
+The Go module remains usable as an embedded local library. Hosted mode adds the
+network, identity, concurrency, backup, and operational boundaries needed for a
+shared source of truth.
 
-The module path is:
+## Hosted model
+
+- A single Jaybase process owns the writable data volume.
+- Caddy terminates HTTPS and obtains certificates automatically.
+- Bearer credentials map to `reader`, `writer`, or `admin`; plaintext tokens are
+  never stored by Jaybase.
+- Every hosted append includes an expected root and idempotency key, making
+  concurrent updates explicit and retries safe.
+- Payloads use AES-256-GCM at rest. The data key is mounted separately from the
+  volume and excluded from snapshots.
+- Snapshots are consistent archives of encrypted nodes and refs, suitable for
+  off-host replication.
+- Containers run as non-root with a read-only root filesystem and dropped Linux
+  capabilities.
+
+See [architecture](docs/architecture.md), [security](docs/security.md),
+[API](docs/api.md), and [operations](docs/operations.md) for the full contract.
+
+## Deploy in five steps
+
+Prerequisites: a Linux host with Docker Compose, ports 80 and 443 reachable, and
+an A/AAAA record pointing a domain at the host.
 
 ```sh
-github.com/kyle-visner/jaybase
+cp .env.example .env
+# Edit .env and set JAYBASE_DOMAIN.
+
+go run ./cmd/jaybase-server init ./secrets
+# Save the three printed tokens in a password manager. They are shown once.
+
+docker compose up -d --build
+docker compose ps
+curl https://jaybase.example.com/health/ready
 ```
 
-## Scope
+The initializer refuses to replace existing secrets. The server also refuses to
+start without an external data-key file and a valid hashed credential file.
 
-- Append-only Merkle-DAG-style JSON nodes.
-- SHA-256 content addressing.
-- AES-256-GCM encrypted payloads at rest.
-- Root refs and named refs.
-- Audit traversal from any root.
+## Append and read a fact
 
-Domain concepts such as accounting, invoices, RBAC, notes, and payouts live in the accounting CLI project that consumes this module.
+Fetch the current root first:
+
+```sh
+export JAYBASE_URL=https://jaybase.example.com
+export JAYBASE_TOKEN='the-writer-token'
+
+curl -fsS \
+  -H "Authorization: Bearer $JAYBASE_TOKEN" \
+  "$JAYBASE_URL/v1/root"
+```
+
+Use that root as `expected_root` and a new stable idempotency key for the logical
+operation. An empty string is the expected root of a new database.
+
+```sh
+curl -fsS -X POST "$JAYBASE_URL/v1/events" \
+  -H "Authorization: Bearer $JAYBASE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: fact-customer-42-primary-contact-v1" \
+  --data '{
+    "type": "business.fact",
+    "entity_id": "customer:42",
+    "command": "fact assert",
+    "payload": {"primary_contact": "Ada Lovelace"},
+    "expected_root": ""
+  }'
+```
+
+Readers get metadata by default. Payload decryption must be explicitly requested:
+
+```sh
+curl -fsS \
+  -H "Authorization: Bearer $JAYBASE_TOKEN" \
+  "$JAYBASE_URL/v1/events?include_payload=true&limit=100"
+```
+
+## Embedded library
+
+```go
+store, err := jaybase.OpenStore(".jaybase")
+root, err := store.Append(jaybase.Context{Actor: "agent"}, jaybase.AppendOptions{
+    Type: "business.fact", Command: "fact assert", Payload: fact,
+})
+```
+
+`OpenStore` retains the original local key fallback for compatibility.
+Long-running hosted processes should use `OpenStoreWithDataKey`; the bundled
+server enforces that choice.
 
 ## Verify
 
 ```sh
-go test ./...
-```
-
-## Performance Benchmarks
-
-```sh
-go test -run '^$' -bench . -benchmem ./...
+GOCACHE=/tmp/jaybase-gocache go test -race ./...
+GOCACHE=/tmp/jaybase-gocache go vet ./...
+docker compose config
+docker build -t jaybase:test .
 ```
 
 ## License

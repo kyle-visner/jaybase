@@ -1,0 +1,64 @@
+# Hosted architecture
+
+## Trust and data flow
+
+```text
+agent or operator
+    |
+    | HTTPS + bearer credential
+    v
+Caddy (public ports 80/443)
+    |
+    | private Compose network
+    v
+Jaybase server (single non-root writer)
+    |                    |
+    | encrypted nodes    | consistent encrypted snapshots
+    v                    v
+data volume          backup volume -> mandatory off-host copy
+
+data-key file and credential hashes are mounted as separate Docker secrets
+```
+
+The service is intentionally single-writer. The current storage format is a
+linear Merkle chain with a mutable root ref, not a distributed consensus
+protocol. One process serializes writes with an in-process lock and atomically
+replaces refs only after a content-addressed node is durable. Do not run multiple
+Jaybase replicas against one volume.
+
+## Write contract
+
+Every hosted write carries two independent safety controls:
+
+1. `expected_root` implements compare-and-swap. If another writer committed
+   first, the server returns `409 conflict` and the caller must reread/reconcile.
+2. `Idempotency-Key` identifies one logical operation for one credential. The
+   server hashes the credential ID plus key into the node. Retrying identical
+   content returns the original node, even after later events; using the same key
+   for different content returns `409 conflict`.
+
+The authenticated credential supplies the node's actor and role. Clients cannot
+claim another identity in the request body.
+
+## Storage and durability
+
+Each node contains metadata, parent hashes, and an AES-256-GCM sealed JSON
+payload. The SHA-256 node address covers both metadata and ciphertext. New node
+files are created without overwriting an existing address, synced, and then the
+root ref is written through a same-directory temporary file, rename, and
+directory sync.
+
+This ordering means a crash can leave an unreachable node, but cannot make the
+root reference a partially written node. Snapshots include all encrypted nodes
+and refs, so an unreachable node is retained for forensic recovery.
+
+## Scaling boundary
+
+The reference deployment scales clients, not writers. It is appropriate for a
+small organization whose fact stream fits on one durable host and whose recovery
+objective is satisfied by frequent off-host snapshots.
+
+A future multi-region version must replace the filesystem ref update with a
+transactional coordination layer (for example, a database row locked by version)
+or define explicit branch/merge semantics. Placing this version on a shared
+network filesystem or increasing the replica count is not a valid substitute.

@@ -1,0 +1,6 @@
+.git
+.github
+.jaybase
+backups
+secrets
+*.tar.gz
