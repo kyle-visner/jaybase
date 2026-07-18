@@ -1,0 +1,339 @@
+package jaybase
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"encoding/base64"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func TestAppendAtSerializesConcurrentWriters(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 24
+	start := make(chan struct{})
+	results := make(chan error, writers)
+	var group sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			_, err := store.AppendAt(Context{Actor: "writer", Role: "writer"}, AppendOptions{
+				Type: "fact", Command: "fact create", Payload: map[string]bool{"ok": true},
+			}, "")
+			results <- err
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+
+	succeeded, conflicted := 0, 0
+	for err := range results {
+		if err == nil {
+			succeeded++
+			continue
+		}
+		var app *AppError
+		if errors.As(err, &app) && app.Code == ErrConflict {
+			conflicted++
+			continue
+		}
+		t.Fatalf("unexpected append error: %v", err)
+	}
+	if succeeded != 1 || conflicted != writers-1 {
+		t.Fatalf("expected one success and %d conflicts, got %d and %d", writers-1, succeeded, conflicted)
+	}
+}
+
+func TestAppendIdempotentSurvivesNewerEvents(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, replayed, err := store.AppendIdempotent(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]string{"value": "one"},
+	}, "", "request-one", "content-one")
+	if err != nil || replayed {
+		t.Fatalf("first append: replayed=%v err=%v", replayed, err)
+	}
+	second, err := store.AppendAt(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]string{"value": "two"},
+	}, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retried, replayed, err := store.AppendIdempotent(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]string{"value": "one"},
+	}, "", "request-one", "content-one")
+	if err != nil || !replayed || retried != first {
+		t.Fatalf("retry: hash=%q replayed=%v err=%v", retried, replayed, err)
+	}
+	root, err := store.CurrentRoot()
+	if err != nil || root != second {
+		t.Fatalf("retry changed current root: root=%q err=%v", root, err)
+	}
+}
+
+func TestSnapshotExcludesKeysAndPlaintext(t *testing.T) {
+	storeDir := t.TempDir()
+	store, err := OpenStore(storeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := "snapshot-must-not-contain-this-plaintext"
+	if _, err := store.Append(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]string{"secret": secret},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "snapshot.tar.gz")
+	if _, err := store.Snapshot(dest); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(gz)
+	seenManifest, seenRoot, seenNode := false, false, false
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(header.Name, "keys/") {
+			t.Fatalf("snapshot included key path %q", header.Name)
+		}
+		body, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(body), secret) {
+			t.Fatalf("snapshot entry %q contains plaintext payload", header.Name)
+		}
+		switch {
+		case header.Name == "manifest.json":
+			seenManifest = true
+		case header.Name == "refs/root":
+			seenRoot = true
+		case strings.HasPrefix(header.Name, "objects/nodes/"):
+			seenNode = true
+		}
+	}
+	if !seenManifest || !seenRoot || !seenNode {
+		t.Fatalf("incomplete snapshot: manifest=%v root=%v node=%v", seenManifest, seenRoot, seenNode)
+	}
+
+	keyBytes, err := os.ReadFile(filepath.Join(storeDir, "keys", "data.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(keyBytes))); err != nil {
+		t.Fatalf("local test key should remain separately recoverable: %v", err)
+	}
+}
+
+func TestNodePayloadRejectsBadNonceWithoutPanicking(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := Node{Hash: "sha256:" + strings.Repeat("0", 64), SealedPayload: &EncryptedPayload{
+		Algorithm: "AES-256-GCM", Nonce: base64.StdEncoding.EncodeToString([]byte("short")),
+		Ciphertext: base64.StdEncoding.EncodeToString([]byte("ciphertext")),
+	}}
+	if _, err := store.NodePayload(node); err == nil {
+		t.Fatal("expected invalid nonce to be rejected")
+	}
+}
+
+func TestVerifyHeadRejectsMisaddressedNode(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Append(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"value": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Append(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"value": 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstBytes, err := os.ReadFile(store.NodePath(first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.NodePath(second), firstBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.VerifyHead(); err == nil {
+		t.Fatal("expected a node stored under the wrong address to fail readiness")
+	}
+}
+
+func TestBDDEventPageReadsOnlyTheRequestedWindow(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var roots []string
+	for i := 0; i < 4; i++ {
+		root, err := store.Append(Context{Actor: "agent"}, AppendOptions{
+			Type: "fact", Command: "remember", Payload: map[string]int{"sequence": i},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+
+	// Corrupt a node outside the first requested page. A bounded page must not
+	// materialize or verify the entire history as a side effect.
+	thirdPath := store.NodePath(roots[2])
+	thirdBytes, err := os.ReadFile(thirdPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdBytes = []byte(strings.Replace(string(thirdBytes), "ciphertext", "ciphertexu", 1))
+	if err := os.WriteFile(thirdPath, thirdBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := store.EventPage("", 1)
+	if err != nil {
+		t.Fatalf("first bounded page read unrelated corrupt node: %v", err)
+	}
+	if len(page.Nodes) != 1 || page.Nodes[0].Hash != roots[0] || !page.HasMore || page.Root != roots[3] {
+		t.Fatalf("unexpected first page: %#v", page)
+	}
+	if _, err := store.EventPage(roots[1], 2); err == nil {
+		t.Fatal("expected a page containing the corrupt node to fail integrity verification")
+	}
+}
+
+func TestBDDRequestIndexRebuildsAndAvoidsHistoryScanOnReplay(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, replayed, err := store.AppendIdempotent(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 1},
+	}, "", "request-one", "content-one")
+	if err != nil || replayed {
+		t.Fatalf("first append: replayed=%v err=%v", replayed, err)
+	}
+	second, err := store.AppendAt(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 2},
+	}, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendAt(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 3},
+	}, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if record, ok := store.requestIndex["request-one"]; !ok || record.Hash != first || record.RequestHash != "content-one" {
+		t.Fatalf("request index was not rebuilt: %#v, %v", record, ok)
+	}
+
+	// Removing an unrelated historical node makes a linear backward scan fail.
+	// Indexed replay should still return the already committed request directly.
+	if err := os.Remove(store.NodePath(second)); err != nil {
+		t.Fatal(err)
+	}
+	hash, replayed, err := store.AppendIdempotent(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 1},
+	}, "", "request-one", "content-one")
+	if err != nil || !replayed || hash != first {
+		t.Fatalf("indexed replay: hash=%q replayed=%v err=%v", hash, replayed, err)
+	}
+}
+
+func TestBDDOpeningWithWrongDataKeyFailsBeforeServing(t *testing.T) {
+	dir := t.TempDir()
+	firstKey := strings.Repeat("11", 32)
+	wrongKey := strings.Repeat("22", 32)
+	store, err := OpenStoreWithDataKey(dir, firstKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]string{"secret": "correct key"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = OpenStoreWithDataKey(dir, wrongKey)
+	var app *AppError
+	if !errors.As(err, &app) || app.Code != ErrIntegrity {
+		t.Fatalf("expected wrong key to fail with integrity error, got %v", err)
+	}
+}
+
+func TestBDDStoreLockRejectsASecondWriter(t *testing.T) {
+	dir := t.TempDir()
+	first, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenStore(dir)
+	if second != nil {
+		second.Close()
+	}
+	var app *AppError
+	if !errors.As(err, &app) || app.Code != ErrConflict {
+		t.Fatalf("expected second store owner to be rejected, got %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenStore(dir)
+	if err != nil {
+		t.Fatalf("lock was not released on close: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

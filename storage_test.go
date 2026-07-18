@@ -90,7 +90,7 @@ func TestTamperingIsDetected(t *testing.T) {
 		t.Fatal("expected tampered node to fail integrity verification")
 	}
 	var app *AppError
-	if !errors.As(err, &app) || app.Code != ErrValidation {
+	if !errors.As(err, &app) || app.Code != ErrIntegrity {
 		t.Fatalf("expected integrity validation error, got %#v", err)
 	}
 }
