@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || dragonfly || freebsd || illumos || linux || netbsd || openbsd
 
 package jaybase
 
@@ -23,7 +23,7 @@ func acquireStoreLock(dir string) (*storeLock, error) {
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		file.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, appErr(ErrConflict, "store is already open by another process")
+			return nil, appErr(ErrConflict, "store is already open by another process or Store instance")
 		}
 		return nil, err
 	}

@@ -35,8 +35,11 @@ After each successful snapshot, Jaybase deletes the oldest matching
 `jaybase-*.tar.gz` files above that count. `JAYBASE_SNAPSHOT_MIN_FREE_BYTES`
 (default `536870912`, or 512 MiB) is preserved in addition to the estimated
 snapshot size; the endpoint returns `507` before writing when space is
-insufficient. These controls protect the host but do not replace off-host
-retention.
+insufficient. Set the value explicitly to `0` to disable the reserve on a
+dedicated backup volume. These controls protect the host but do not replace
+off-host retention. If retention cleanup fails after an archive is durable, the
+endpoint still returns that archive's `201` result and emits an error log for
+operators; automation must monitor those logs and local volume use.
 
 Keep these items in separate failure domains:
 

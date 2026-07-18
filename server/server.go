@@ -24,15 +24,16 @@ import (
 
 const defaultMaxBodyBytes int64 = 1 << 20
 const defaultSnapshotRetention = 24
-const defaultSnapshotMinFreeBytes uint64 = 512 << 20
 
 type Options struct {
-	Store                *jaybase.Store
-	Auth                 *Authenticator
-	BackupDir            string
-	Logger               *slog.Logger
-	MaxBodyBytes         int64
-	SnapshotRetention    int
+	Store             *jaybase.Store
+	Auth              *Authenticator
+	BackupDir         string
+	Logger            *slog.Logger
+	MaxBodyBytes      int64
+	SnapshotRetention int
+	// SnapshotMinFreeBytes is the reserve preserved after the estimated archive;
+	// zero explicitly disables the reserve.
 	SnapshotMinFreeBytes uint64
 }
 
@@ -45,6 +46,7 @@ type API struct {
 	snapshotRetention    int
 	snapshotMinFreeBytes uint64
 	availableBytes       func(string) (uint64, error)
+	pruneSnapshots       func(string, int) error
 	snapshotMu           sync.Mutex
 	mux                  *http.ServeMux
 }
@@ -67,14 +69,11 @@ func New(options Options) (*API, error) {
 	if options.SnapshotRetention <= 0 {
 		options.SnapshotRetention = defaultSnapshotRetention
 	}
-	if options.SnapshotMinFreeBytes == 0 {
-		options.SnapshotMinFreeBytes = defaultSnapshotMinFreeBytes
-	}
 	api := &API{
 		store: options.Store, auth: options.Auth, backupDir: options.BackupDir,
 		logger: options.Logger, maxBody: options.MaxBodyBytes,
 		snapshotRetention: options.SnapshotRetention, snapshotMinFreeBytes: options.SnapshotMinFreeBytes,
-		availableBytes: diskAvailableBytes, mux: http.NewServeMux(),
+		availableBytes: diskAvailableBytes, pruneSnapshots: pruneSnapshots, mux: http.NewServeMux(),
 	}
 	api.routes()
 	return api, nil
@@ -301,9 +300,9 @@ func (a *API) snapshot(w http.ResponseWriter, _ *http.Request) {
 		writeAPIError(w, err)
 		return
 	}
-	if err := pruneSnapshots(a.backupDir, a.snapshotRetention); err != nil {
-		writeAPIError(w, err)
-		return
+	if err := a.pruneSnapshots(a.backupDir, a.snapshotRetention); err != nil {
+		a.logger.Error("snapshot retention cleanup failed", "error", err,
+			"snapshot", info.Path, "root", info.Root)
 	}
 	writeJSON(w, http.StatusCreated, info)
 }

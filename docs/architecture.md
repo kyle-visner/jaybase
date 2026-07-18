@@ -28,6 +28,12 @@ store. Refs are atomically replaced only after a content-addressed node is
 durable. Do not run multiple Jaybase replicas against one volume, including on a
 shared network filesystem whose locking behavior has not been proven.
 
+Unix-family builds use kernel-released `flock` or `fcntl` advisory locks, so an
+unclean process exit does not strand ownership. The portable fallback for
+non-Unix targets uses exclusive file creation; after a crash on such a target,
+an operator must confirm no Jaybase process owns the store and remove the stale
+`.writer.lock` before reopening it.
+
 ## Write contract
 
 Every hosted write carries two independent safety controls:

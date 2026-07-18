@@ -80,7 +80,8 @@ valid node. If the current ref differs from `expected_root`, the update returns
   node count. The archive does not include the data key. The endpoint refuses
   the request with `507 capacity_exceeded` if the estimated archive would consume
   the configured free-space reserve and prunes the oldest managed snapshots
-  after a successful write.
+  after a successful write. If post-write retention cleanup fails, the durable
+  archive still returns `201`; the server logs the cleanup failure for operators.
 
 Request bodies are limited to 1 MiB at the application and 2 MiB at the proxy;
 an application-limit violation returns one structured `413 validation_error`.

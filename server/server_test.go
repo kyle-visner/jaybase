@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -354,5 +355,50 @@ func TestBDDSnapshotRetentionCapacityAndClockAreEnforced(t *testing.T) {
 	capacity := api.request(t, http.MethodPost, "/v1/admin/snapshots", api.tokens["admin-agent"], "", "")
 	if capacity.Code != http.StatusInsufficientStorage || !strings.Contains(capacity.Body.String(), `"capacity_exceeded"`) {
 		t.Fatalf("capacity status=%d body=%s", capacity.Code, capacity.Body.String())
+	}
+}
+
+func TestBDDExplicitZeroSnapshotReserveIsHonored(t *testing.T) {
+	api := newTestAPIWithOptions(t, func(options *Options) {
+		options.SnapshotMinFreeBytes = 0
+	})
+	if _, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]bool{"valid": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api.api.availableBytes = func(string) (uint64, error) { return 2 << 20, nil }
+
+	response := api.request(t, http.MethodPost, "/v1/admin/snapshots", api.tokens["admin-agent"], "", "")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("explicit zero reserve status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestBDDPruneFailureDoesNotHideDurableSnapshot(t *testing.T) {
+	api := newTestAPIWithOptions(t, func(options *Options) {
+		options.SnapshotMinFreeBytes = 0
+	})
+	if _, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]bool{"valid": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	api.api.pruneSnapshots = func(string, int) error { return errors.New("retention storage unavailable") }
+
+	response := api.request(t, http.MethodPost, "/v1/admin/snapshots", api.tokens["admin-agent"], "", "")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("durable snapshot hidden by prune failure: status=%d body=%s", response.Code, response.Body.String())
+	}
+	var info jaybase.SnapshotInfo
+	if err := json.Unmarshal(response.Body.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(api.backup, info.Path)); err != nil {
+		t.Fatalf("created snapshot missing after prune failure: %v", err)
+	}
+	if !strings.Contains(api.logs.String(), "snapshot retention cleanup failed") ||
+		!strings.Contains(api.logs.String(), "retention storage unavailable") {
+		t.Fatalf("prune failure was not logged: %s", api.logs.String())
 	}
 }
