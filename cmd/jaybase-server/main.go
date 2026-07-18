@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -66,12 +67,22 @@ func serve() error {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
+	defer store.Close()
 	auth, err := server.LoadAuthenticator(authFile)
+	if err != nil {
+		return err
+	}
+	snapshotRetention, err := envInt("JAYBASE_SNAPSHOT_RETENTION", 24)
+	if err != nil {
+		return err
+	}
+	snapshotMinFreeBytes, err := envUint64("JAYBASE_SNAPSHOT_MIN_FREE_BYTES", 512<<20)
 	if err != nil {
 		return err
 	}
 	api, err := server.New(server.Options{
 		Store: store, Auth: auth, BackupDir: strings.TrimSpace(os.Getenv("JAYBASE_BACKUP_DIR")), Logger: logger,
+		SnapshotRetention: snapshotRetention, SnapshotMinFreeBytes: snapshotMinFreeBytes,
 	})
 	if err != nil {
 		return err
@@ -104,6 +115,30 @@ func serve() error {
 		return err
 	}
 	return nil
+}
+
+func envInt(name string, fallback int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 1 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return value, nil
+}
+
+func envUint64(name string, fallback uint64) (uint64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	return value, nil
 }
 
 func healthcheck() error {

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,18 +16,25 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	jaybase "github.com/kyle-visner/jaybase"
 )
 
 type testAPI struct {
 	handler http.Handler
+	api     *API
 	store   *jaybase.Store
 	backup  string
 	tokens  map[string]string
+	logs    *bytes.Buffer
 }
 
 func newTestAPI(t *testing.T) testAPI {
+	return newTestAPIWithOptions(t, nil)
+}
+
+func newTestAPIWithOptions(t *testing.T, configure func(*Options)) testAPI {
 	t.Helper()
 	tokens := map[string]string{
 		"reader-agent": strings.Repeat("r", 64),
@@ -58,15 +66,21 @@ func newTestAPI(t *testing.T) testAPI {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = store.Close() })
 	backup := t.TempDir()
-	api, err := New(Options{
+	logs := &bytes.Buffer{}
+	options := Options{
 		Store: store, Auth: auth, BackupDir: backup,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+		Logger: slog.New(slog.NewJSONHandler(logs, nil)),
+	}
+	if configure != nil {
+		configure(&options)
+	}
+	api, err := New(options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return testAPI{handler: api.Handler(), store: store, backup: backup, tokens: tokens}
+	return testAPI{handler: api.Handler(), api: api, store: store, backup: backup, tokens: tokens, logs: logs}
 }
 
 func (api testAPI) request(t *testing.T, method, path, token, idempotency, body string) *httptest.ResponseRecorder {
@@ -180,5 +194,165 @@ func TestAdminSnapshotEndpointCreatesKeylessArchive(t *testing.T) {
 	}
 	if strings.Contains(contents.String(), "classified") || strings.Contains(contents.String(), "keys/data.key") {
 		t.Fatal("snapshot exposed plaintext or bundled a key")
+	}
+}
+
+func TestBDDEventEndpointHonorsThePageLimitBeforeReadingHistory(t *testing.T) {
+	api := newTestAPI(t)
+	var roots []string
+	for i := 0; i < 3; i++ {
+		root, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+			Type: "fact", Command: "remember", Payload: map[string]int{"sequence": i},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	path := api.store.NodePath(roots[2])
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(string(raw), "ciphertext", "ciphertexu", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	response := api.request(t, http.MethodGet, "/v1/events?limit=1", api.tokens["reader-agent"], "", "")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), roots[0]) {
+		t.Fatalf("bounded page touched unrelated history: status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestBDDOversizedJSONReturnsOneStructured413(t *testing.T) {
+	api := newTestAPIWithOptions(t, func(options *Options) { options.MaxBodyBytes = 64 })
+	body := `{"type":"fact","command":"remember","payload":{"value":"` + strings.Repeat("x", 128) + `"},"expected_root":""}`
+	response := api.request(t, http.MethodPost, "/v1/events", api.tokens["writer-agent"], "oversized-request", body)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized response status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Count(response.Body.String(), `"error"`) != 1 || !strings.Contains(response.Body.String(), `"validation_error"`) {
+		t.Fatalf("oversized response is not one structured error: %s", response.Body.String())
+	}
+}
+
+func TestBDDIntegrityFailureUsesServerErrorAndNotReadyStatus(t *testing.T) {
+	api := newTestAPI(t)
+	root, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]bool{"valid": true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := api.store.NodePath(root)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(string(raw), "ciphertext", "ciphertexu", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ready := api.request(t, http.MethodGet, "/health/ready", "", "", "")
+	if ready.Code != http.StatusServiceUnavailable || !strings.Contains(ready.Body.String(), `"status":"not_ready"`) {
+		t.Fatalf("readiness status=%d body=%s", ready.Code, ready.Body.String())
+	}
+	events := api.request(t, http.MethodGet, "/v1/events?include_payload=true", api.tokens["reader-agent"], "", "")
+	if events.Code != http.StatusInternalServerError || !strings.Contains(events.Body.String(), `"integrity_error"`) {
+		t.Fatalf("integrity read status=%d body=%s", events.Code, events.Body.String())
+	}
+}
+
+func TestBDDAccessLogsAttributeAuthenticatedAndRejectedRequests(t *testing.T) {
+	api := newTestAPI(t)
+	validToken := api.tokens["reader-agent"]
+	if response := api.request(t, http.MethodGet, "/v1/root", validToken, "", ""); response.Code != http.StatusOK {
+		t.Fatalf("authenticated request status=%d", response.Code)
+	}
+	if response := api.request(t, http.MethodGet, "/v1/root", "invalid-token-that-is-long-enough-000000", "", ""); response.Code != http.StatusUnauthorized {
+		t.Fatalf("rejected request status=%d", response.Code)
+	}
+	logs := api.logs.String()
+	if !strings.Contains(logs, `"principal_id":"reader-agent"`) || !strings.Contains(logs, `"role":"reader"`) {
+		t.Fatalf("authenticated principal missing from logs: %s", logs)
+	}
+	if !strings.Contains(logs, `"principal_id":"unauthenticated"`) {
+		t.Fatalf("rejected principal marker missing from logs: %s", logs)
+	}
+	if strings.Contains(logs, validToken) {
+		t.Fatal("access log leaked a bearer token")
+	}
+}
+
+func TestBDDNamedRefUpdatesUseCompareAndSwap(t *testing.T) {
+	api := newTestAPI(t)
+	first, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBody := fmt.Sprintf(`{"root":%q,"expected_root":""}`, first)
+	created := api.request(t, http.MethodPut, "/v1/refs/checkpoint", api.tokens["writer-agent"], "", createBody)
+	if created.Code != http.StatusOK {
+		t.Fatalf("create named ref status=%d body=%s", created.Code, created.Body.String())
+	}
+	staleBody := fmt.Sprintf(`{"root":%q,"expected_root":""}`, second)
+	stale := api.request(t, http.MethodPut, "/v1/refs/checkpoint", api.tokens["writer-agent"], "", staleBody)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale named ref status=%d body=%s", stale.Code, stale.Body.String())
+	}
+	updateBody := fmt.Sprintf(`{"root":%q,"expected_root":%q}`, second, first)
+	updated := api.request(t, http.MethodPut, "/v1/refs/checkpoint", api.tokens["writer-agent"], "", updateBody)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("CAS named ref status=%d body=%s", updated.Code, updated.Body.String())
+	}
+}
+
+func TestBDDSnapshotRetentionCapacityAndClockAreEnforced(t *testing.T) {
+	api := newTestAPIWithOptions(t, func(options *Options) {
+		options.SnapshotRetention = 2
+		options.SnapshotMinFreeBytes = 1
+	})
+	root, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]bool{"valid": true},
+	})
+	if err != nil || root == "" {
+		t.Fatalf("append root=%q err=%v", root, err)
+	}
+	base := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	call := 0
+	api.store.SetClock(func() time.Time {
+		value := base.Add(time.Duration(call) * time.Second)
+		call++
+		return value
+	})
+	for i := 0; i < 3; i++ {
+		response := api.request(t, http.MethodPost, "/v1/admin/snapshots", api.tokens["admin-agent"], "", "")
+		if response.Code != http.StatusCreated {
+			t.Fatalf("snapshot %d status=%d body=%s", i, response.Code, response.Body.String())
+		}
+		if i == 0 && !strings.Contains(response.Body.String(), "jaybase-20300102T030405.000000000Z.tar.gz") {
+			t.Fatalf("snapshot filename did not use store clock: %s", response.Body.String())
+		}
+	}
+	archives, err := filepath.Glob(filepath.Join(api.backup, "jaybase-*.tar.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 2 {
+		t.Fatalf("retention kept %d snapshots, want 2: %v", len(archives), archives)
+	}
+
+	api.api.availableBytes = func(string) (uint64, error) { return 0, nil }
+	capacity := api.request(t, http.MethodPost, "/v1/admin/snapshots", api.tokens["admin-agent"], "", "")
+	if capacity.Code != http.StatusInsufficientStorage || !strings.Contains(capacity.Body.String(), `"capacity_exceeded"`) {
+		t.Fatalf("capacity status=%d body=%s", capacity.Code, capacity.Body.String())
 	}
 }

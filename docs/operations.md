@@ -30,6 +30,14 @@ The response names an archive in `/var/backups/jaybase` inside the Jaybase
 container. Copy it to a different machine, account, or object-storage service.
 A snapshot left only in the local Docker volume is not a backup.
 
+`JAYBASE_SNAPSHOT_RETENTION` (default `24`) bounds the managed local archives.
+After each successful snapshot, Jaybase deletes the oldest matching
+`jaybase-*.tar.gz` files above that count. `JAYBASE_SNAPSHOT_MIN_FREE_BYTES`
+(default `536870912`, or 512 MiB) is preserved in addition to the estimated
+snapshot size; the endpoint returns `507` before writing when space is
+insufficient. These controls protect the host but do not replace off-host
+retention.
+
 Keep these items in separate failure domains:
 
 - snapshot archive;
@@ -39,6 +47,11 @@ Keep these items in separate failure domains:
 Use a scheduler on the host or in an external automation system to trigger and
 export snapshots. Do not place the admin token directly in a crontab; read it
 from a root-owned credential file or secret manager.
+
+Compose also sets default limits of one CPU and 512 MiB for Jaybase and half a
+CPU and 256 MiB for Caddy. Override `JAYBASE_CPUS`, `JAYBASE_MEMORY_LIMIT`,
+`CADDY_CPUS`, and `CADDY_MEMORY_LIMIT` in `.env` only after measuring workload
+and restore behavior.
 
 ## Integrity check
 

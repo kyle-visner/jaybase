@@ -164,10 +164,13 @@ role, command, time, and graph shape—is not encrypted.
 Named refs are durable checkpoints, not mutable facts.
 
 - Read: `GET /v1/refs/{name}`.
-- Write: `PUT /v1/refs/{name}` with `{"root":"sha256:..."}`.
+- Write: `PUT /v1/refs/{name}` with
+  `{"root":"sha256:new","expected_root":"sha256:old"}`. Use an empty
+  `expected_root` only to create a ref that does not exist.
 
 Use simple file-safe names. The root must already exist. A ref does not create a
-branch or freeze the current database root.
+branch or freeze the current database root. On `409`, reread the ref and
+reconcile; never overwrite a checkpoint that moved concurrently.
 
 ## Error handling
 
@@ -183,11 +186,17 @@ Handle codes deliberately:
 - `permission_denied`: stop and obtain the correct least-privilege credential.
 - `not_found`: refresh the root, cursor, or named-ref assumption.
 - `conflict`: follow the conflict algorithm above.
+- `integrity_error`: stop writes and alert an operator; stored data failed a
+  structural, hash, or decryption check.
+- `capacity_exceeded`: an administrative snapshot lacks its configured free
+  space reserve; free or extend backup storage before retrying.
 - `internal_error`: retry the identical idempotent request with bounded backoff;
   alert an operator if it persists.
 
 Also expect HTTP `401` for a missing or invalid token, `403` for insufficient
-role, and `415` for a non-JSON body. Request bodies are limited to 1 MiB.
+role, `413` for a body over 1 MiB, `415` for a non-JSON body, `503` with
+`status: not_ready` when the store head cannot be verified, and `507` when a
+snapshot would violate the free-space reserve.
 
 Use bounded exponential backoff with jitter for transient transport and server
 errors. Do not retry validation, authentication, authorization, or semantic

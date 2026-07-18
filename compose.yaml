@@ -11,6 +11,8 @@ services:
       JAYBASE_BACKUP_DIR: /var/backups/jaybase
       JAYBASE_DATA_KEY_FILE: /run/secrets/jaybase_data_key
       JAYBASE_AUTH_FILE: /run/secrets/jaybase_auth
+      JAYBASE_SNAPSHOT_RETENTION: ${JAYBASE_SNAPSHOT_RETENTION:-24}
+      JAYBASE_SNAPSHOT_MIN_FREE_BYTES: ${JAYBASE_SNAPSHOT_MIN_FREE_BYTES:-536870912}
     secrets:
       - jaybase_data_key
       - jaybase_auth
@@ -19,6 +21,8 @@ services:
       - jaybase_backups:/var/backups/jaybase
     expose:
       - "8080"
+    cpus: ${JAYBASE_CPUS:-1.0}
+    mem_limit: ${JAYBASE_MEMORY_LIMIT:-512m}
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1700,uid=65532,gid=65532
@@ -45,6 +49,8 @@ services:
       - "80:80"
       - "443:443"
       - "443:443/udp"
+    cpus: ${CADDY_CPUS:-0.5}
+    mem_limit: ${CADDY_MEMORY_LIMIT:-256m}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

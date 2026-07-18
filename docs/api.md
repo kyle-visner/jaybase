@@ -14,7 +14,8 @@ Roles are cumulative: writers can read; admins can read and write.
 `GET /health/live` reports that the process is running. `GET /health/ready`
 verifies that the current root addresses a valid, complete head node in constant
 time. Neither route exposes data or requires authentication; the admin verify
-route performs the full history and decryption check.
+route performs the full history and decryption check. A failed readiness check
+returns `503` with `status: "not_ready"` and an `integrity_error`.
 
 ## Root
 
@@ -62,10 +63,13 @@ passing the final returned event hash as `after`.
 ## Named refs
 
 - `GET /v1/refs/{name}` requires `reader`.
-- `PUT /v1/refs/{name}` requires `writer` and body `{"root":"sha256:..."}`.
+- `PUT /v1/refs/{name}` requires `writer` and body
+  `{"root":"sha256:new","expected_root":"sha256:old"}`. Use an empty
+  `expected_root` only when creating a new ref.
 
 A ref name must be a simple filename. The selected root must name an existing,
-valid node.
+valid node. If the current ref differs from `expected_root`, the update returns
+`409 conflict` without overwriting it.
 
 ## Administration
 
@@ -73,6 +77,12 @@ valid node.
   decrypts every reachable payload.
 - `POST /v1/admin/snapshots` requires `admin`. It creates a consistent archive in
   the configured backup volume and returns its filename, root, timestamp, and
-  node count. The archive does not include the data key.
+  node count. The archive does not include the data key. The endpoint refuses
+  the request with `507 capacity_exceeded` if the estimated archive would consume
+  the configured free-space reserve and prunes the oldest managed snapshots
+  after a successful write.
 
-Request bodies are limited to 1 MiB at the application and 2 MiB at the proxy.
+Request bodies are limited to 1 MiB at the application and 2 MiB at the proxy;
+an application-limit violation returns one structured `413 validation_error`.
+Stored-data validation, hash, and decryption failures return
+`500 integrity_error`, not a client validation error.

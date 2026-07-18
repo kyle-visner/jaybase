@@ -27,6 +27,8 @@ const (
 	ErrPermission ErrorCode = "permission_denied"
 	ErrNotFound   ErrorCode = "not_found"
 	ErrConflict   ErrorCode = "conflict"
+	ErrIntegrity  ErrorCode = "integrity_error"
+	ErrCapacity   ErrorCode = "capacity_exceeded"
 )
 
 type AppError struct {
@@ -43,10 +45,25 @@ func appErr(code ErrorCode, format string, args ...any) *AppError {
 }
 
 type Store struct {
-	dir string
-	now func() time.Time
-	key []byte
-	mu  sync.RWMutex
+	dir          string
+	now          func() time.Time
+	key          []byte
+	mu           sync.RWMutex
+	lock         *storeLock
+	history      []string
+	historyIndex map[string]int
+	requestIndex map[string]requestRecord
+}
+
+type requestRecord struct {
+	Hash        string
+	RequestHash string
+}
+
+type EventPage struct {
+	Nodes   []Node
+	Root    string
+	HasMore bool
 }
 
 type Context struct {
@@ -119,7 +136,10 @@ func openStore(dir, encodedKey string, requireExplicitKey bool) (*Store, error) 
 	if dir == "" {
 		dir = ".jaybase"
 	}
-	s := &Store{dir: dir, now: func() time.Time { return time.Now().UTC() }}
+	s := &Store{
+		dir: dir, now: func() time.Time { return time.Now().UTC() },
+		historyIndex: make(map[string]int), requestIndex: make(map[string]requestRecord),
+	}
 	for _, child := range []string{"objects/nodes", "refs/named", "keys"} {
 		path := filepath.Join(dir, child)
 		if err := os.MkdirAll(path, 0o700); err != nil {
@@ -132,8 +152,18 @@ func openStore(dir, encodedKey string, requireExplicitKey bool) (*Store, error) 
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return nil, err
 	}
+	lock, err := acquireStoreLock(dir)
+	if err != nil {
+		return nil, err
+	}
+	s.lock = lock
+	opened := false
+	defer func() {
+		if !opened {
+			_ = s.lock.Close()
+		}
+	}()
 	var key []byte
-	var err error
 	if requireExplicitKey {
 		if strings.TrimSpace(encodedKey) == "" {
 			return nil, appErr(ErrValidation, "an explicit data key is required")
@@ -146,7 +176,59 @@ func openStore(dir, encodedKey string, requireExplicitKey bool) (*Store, error) 
 		return nil, err
 	}
 	s.key = key
+	if err := s.rebuildIndexes(); err != nil {
+		return nil, err
+	}
+	if len(s.history) > 0 {
+		head, err := s.readNode(s.history[len(s.history)-1])
+		if err != nil {
+			return nil, err
+		}
+		if _, err := s.NodePayload(head); err != nil {
+			return nil, appErr(ErrIntegrity, "data key cannot decrypt the current head: %v", err)
+		}
+	}
+	opened = true
 	return s, nil
+}
+
+func (s *Store) rebuildIndexes() error {
+	root, err := s.currentRoot()
+	if err != nil {
+		return err
+	}
+	nodes, err := s.nodesFromRoot(root)
+	if err != nil {
+		return err
+	}
+	s.history = make([]string, 0, len(nodes))
+	s.historyIndex = make(map[string]int, len(nodes))
+	s.requestIndex = make(map[string]requestRecord)
+	for i, node := range nodes {
+		s.history = append(s.history, node.Hash)
+		s.historyIndex[node.Hash] = i
+		if node.RequestID == "" {
+			continue
+		}
+		if existing, ok := s.requestIndex[node.RequestID]; ok {
+			return appErr(ErrIntegrity, "duplicate request ID %s in nodes %s and %s", node.RequestID, existing.Hash, node.Hash)
+		}
+		s.requestIndex[node.RequestID] = requestRecord{Hash: node.Hash, RequestHash: node.RequestHash}
+	}
+	return nil
+}
+
+// Close releases the store's process-wide writer lock. A Store must not be used
+// after Close. Close is safe to call more than once.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lock == nil {
+		return nil
+	}
+	err := s.lock.Close()
+	s.lock = nil
+	return err
 }
 
 func (s *Store) SetClock(now func() time.Time) {
@@ -183,8 +265,18 @@ func (s *Store) VerifyHead() error {
 	if err != nil || root == "" {
 		return err
 	}
+	if root != s.indexedRoot() {
+		return appErr(ErrIntegrity, "current root does not match the in-memory history index")
+	}
 	_, err = s.readNode(root)
 	return err
+}
+
+func (s *Store) indexedRoot() string {
+	if len(s.history) == 0 {
+		return ""
+	}
+	return s.history[len(s.history)-1]
 }
 
 func (s *Store) currentRoot() (string, error) {
@@ -225,33 +317,11 @@ func (s *Store) AppendIdempotent(ctx Context, opts AppendOptions, expectedRoot, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	root, err := s.currentRoot()
-	if err != nil {
-		return "", false, err
-	}
-	seen := make(map[string]bool)
-	for cursor := root; cursor != ""; {
-		if seen[cursor] {
-			return "", false, appErr(ErrValidation, "cycle detected while looking up request ID at %s", cursor)
+	if record, ok := s.requestIndex[requestID]; ok {
+		if record.RequestHash != requestHash {
+			return "", false, appErr(ErrConflict, "request ID was already used for different content")
 		}
-		seen[cursor] = true
-		node, err := s.readNode(cursor)
-		if err != nil {
-			return "", false, err
-		}
-		if node.RequestID == requestID {
-			if node.RequestHash != requestHash {
-				return "", false, appErr(ErrConflict, "request ID was already used for different content")
-			}
-			return node.Hash, true, nil
-		}
-		if len(node.Parents) == 0 {
-			break
-		}
-		if len(node.Parents) != 1 {
-			return "", false, appErr(ErrValidation, "merge roots are not supported")
-		}
-		cursor = node.Parents[0]
+		return record.Hash, true, nil
 	}
 
 	opts.RequestID = requestID
@@ -270,6 +340,9 @@ func (s *Store) append(ctx Context, opts AppendOptions, expectedRoot *string) (s
 	root, err := s.currentRoot()
 	if err != nil {
 		return "", err
+	}
+	if root != s.indexedRoot() {
+		return "", appErr(ErrIntegrity, "current root does not match the in-memory history index")
 	}
 	if expectedRoot != nil && root != *expectedRoot {
 		return "", appErr(ErrConflict, "root changed: expected %q, current %q", *expectedRoot, root)
@@ -322,6 +395,11 @@ func (s *Store) append(ctx Context, opts AppendOptions, expectedRoot *string) (s
 	if err := atomicWriteFile(s.rootPath(), []byte(hash+"\n"), 0o600); err != nil {
 		return "", err
 	}
+	s.historyIndex[hash] = len(s.history)
+	s.history = append(s.history, hash)
+	if node.RequestID != "" {
+		s.requestIndex[node.RequestID] = requestRecord{Hash: hash, RequestHash: node.RequestHash}
+	}
 	return hash, nil
 }
 
@@ -340,10 +418,10 @@ func (s *Store) readNode(hash string) (Node, error) {
 		return node, err
 	}
 	if err := json.Unmarshal(b, &node); err != nil {
-		return node, err
+		return node, appErr(ErrIntegrity, "node %s is not valid JSON: %v", hash, err)
 	}
 	if node.Hash != hash {
-		return node, appErr(ErrValidation, "node address %s contains node %s", hash, node.Hash)
+		return node, appErr(ErrIntegrity, "node address %s contains node %s", hash, node.Hash)
 	}
 	if err := verifyNode(node); err != nil {
 		return node, err
@@ -364,7 +442,7 @@ func verifyNode(node Node) error {
 	sum := sha256.Sum256(contentBytes)
 	expected := "sha256:" + hex.EncodeToString(sum[:])
 	if expected != node.Hash {
-		return appErr(ErrValidation, "node integrity check failed for %s", node.Hash)
+		return appErr(ErrIntegrity, "node integrity check failed for %s", node.Hash)
 	}
 	return nil
 }
@@ -383,7 +461,7 @@ func (s *Store) nodesFromRoot(root string) ([]Node, error) {
 	seen := map[string]bool{}
 	for root != "" {
 		if seen[root] {
-			return nil, appErr(ErrValidation, "cycle detected while walking DAG at %s", root)
+			return nil, appErr(ErrIntegrity, "cycle detected while walking DAG at %s", root)
 		}
 		seen[root] = true
 		node, err := s.readNode(root)
@@ -395,7 +473,7 @@ func (s *Store) nodesFromRoot(root string) ([]Node, error) {
 			break
 		}
 		if len(node.Parents) > 1 {
-			return nil, appErr(ErrValidation, "merge roots are not supported in phase 1")
+			return nil, appErr(ErrIntegrity, "merge roots are not supported in phase 1")
 		}
 		root = node.Parents[0]
 	}
@@ -412,7 +490,56 @@ func (s *Store) AuditLog() ([]Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.nodesFromRoot(root)
+	if root != s.indexedRoot() {
+		return nil, appErr(ErrIntegrity, "current root does not match the in-memory history index")
+	}
+	nodes := make([]Node, 0, len(s.history))
+	for _, hash := range s.history {
+		node, err := s.readNode(hash)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, nil
+}
+
+// EventPage returns at most limit events in oldest-to-newest order without
+// materializing the complete history. The after hash is exclusive.
+func (s *Store) EventPage(after string, limit int) (EventPage, error) {
+	if limit < 1 {
+		return EventPage{}, appErr(ErrValidation, "event page limit must be positive")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	root, err := s.currentRoot()
+	if err != nil {
+		return EventPage{}, err
+	}
+	if root != s.indexedRoot() {
+		return EventPage{}, appErr(ErrIntegrity, "current root does not match the in-memory history index")
+	}
+	start := 0
+	if after != "" {
+		position, ok := s.historyIndex[after]
+		if !ok {
+			return EventPage{}, appErr(ErrNotFound, "after root was not found in the current history")
+		}
+		start = position + 1
+	}
+	end := start + limit
+	if end > len(s.history) {
+		end = len(s.history)
+	}
+	nodes := make([]Node, 0, end-start)
+	for _, hash := range s.history[start:end] {
+		node, err := s.readNode(hash)
+		if err != nil {
+			return EventPage{}, err
+		}
+		nodes = append(nodes, node)
+	}
+	return EventPage{Nodes: nodes, Root: root, HasMore: end < len(s.history)}, nil
 }
 
 func (s *Store) NodePayload(node Node) ([]byte, error) {
@@ -422,16 +549,45 @@ func (s *Store) NodePayload(node Node) ([]byte, error) {
 	if len(node.Payload) > 0 {
 		return node.Payload, nil
 	}
-	return nil, appErr(ErrValidation, "node %s has no payload", node.Hash)
+	return nil, appErr(ErrIntegrity, "node %s has no payload", node.Hash)
 }
 
 func (s *Store) WriteNamedRef(name string, root string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.writeNamedRef(name, root)
+}
+
+// WriteNamedRefAt updates a named ref only when its current value exactly
+// matches expectedRoot. An empty expectedRoot creates a ref only when it does
+// not already exist.
+func (s *Store) WriteNamedRefAt(name, root, expectedRoot string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name = strings.TrimSpace(name)
+	if err := validateRefName(name); err != nil {
+		return err
+	}
+	path := filepath.Join(s.dir, "refs", "named", name)
+	current := ""
+	b, err := os.ReadFile(path)
+	if err == nil {
+		current = strings.TrimSpace(string(b))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	expectedRoot = strings.TrimSpace(expectedRoot)
+	if current != expectedRoot {
+		return appErr(ErrConflict, "named ref %q changed: expected %q, current %q", name, expectedRoot, current)
+	}
+	return s.writeNamedRef(name, root)
+}
+
+func (s *Store) writeNamedRef(name string, root string) error {
 	name = strings.TrimSpace(name)
 	root = strings.TrimSpace(root)
-	if name == "" || strings.Contains(name, "..") || strings.ContainsAny(name, `/\`) {
-		return appErr(ErrValidation, "named ref must be a simple file-safe name")
+	if err := validateRefName(name); err != nil {
+		return err
 	}
 	if root == "" {
 		return appErr(ErrValidation, "named ref root is required")
@@ -619,15 +775,15 @@ func encryptPayload(key []byte, plaintext []byte) (*EncryptedPayload, error) {
 
 func decryptPayload(key []byte, sealed *EncryptedPayload) ([]byte, error) {
 	if sealed.Algorithm != "AES-256-GCM" {
-		return nil, appErr(ErrValidation, "unsupported payload encryption algorithm %q", sealed.Algorithm)
+		return nil, appErr(ErrIntegrity, "unsupported payload encryption algorithm %q", sealed.Algorithm)
 	}
 	nonce, err := base64.StdEncoding.DecodeString(sealed.Nonce)
 	if err != nil {
-		return nil, err
+		return nil, appErr(ErrIntegrity, "encrypted payload nonce is not valid base64")
 	}
 	ciphertext, err := base64.StdEncoding.DecodeString(sealed.Ciphertext)
 	if err != nil {
-		return nil, err
+		return nil, appErr(ErrIntegrity, "encrypted payload ciphertext is not valid base64")
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -638,11 +794,11 @@ func decryptPayload(key []byte, sealed *EncryptedPayload) ([]byte, error) {
 		return nil, err
 	}
 	if len(nonce) != gcm.NonceSize() {
-		return nil, appErr(ErrValidation, "invalid encrypted payload nonce length")
+		return nil, appErr(ErrIntegrity, "invalid encrypted payload nonce length")
 	}
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, appErr(ErrValidation, "encrypted payload authentication failed")
+		return nil, appErr(ErrIntegrity, "encrypted payload authentication failed")
 	}
 	return plaintext, nil
 }

@@ -33,6 +33,54 @@ type snapshotManifest struct {
 func (s *Store) Snapshot(dest string) (SnapshotInfo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.snapshot(dest, s.now().UTC())
+}
+
+// CreateSnapshot creates a timestamped snapshot in dir. The filename and
+// manifest timestamp are derived from the same store clock reading.
+func (s *Store) CreateSnapshot(dir string) (SnapshotInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	created := s.now().UTC()
+	name := fmt.Sprintf("jaybase-%s.tar.gz", created.Format("20060102T150405.000000000Z"))
+	info, err := s.snapshot(filepath.Join(dir, name), created)
+	if err != nil {
+		return SnapshotInfo{}, err
+	}
+	info.Path = name
+	return info, nil
+}
+
+// SnapshotSizeEstimate returns a conservative estimate of the temporary free
+// space needed to create a gzip snapshot. This intentionally scans only files
+// that are included in snapshots and is used only by the admin endpoint.
+func (s *Store) SnapshotSizeEstimate() (uint64, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var total uint64 = 1 << 20
+	for _, subtree := range []string{"objects/nodes", "refs"} {
+		base := filepath.Join(s.dir, filepath.FromSlash(subtree))
+		err := filepath.Walk(base, func(path string, fileInfo os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if fileInfo.IsDir() {
+				return nil
+			}
+			if !fileInfo.Mode().IsRegular() {
+				return fmt.Errorf("refusing to snapshot non-regular file %s", path)
+			}
+			total += uint64(fileInfo.Size()) + 1024
+			return nil
+		})
+		if err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
+}
+
+func (s *Store) snapshot(dest string, created time.Time) (SnapshotInfo, error) {
 
 	root, err := s.currentRoot()
 	if err != nil {
@@ -42,7 +90,6 @@ func (s *Store) Snapshot(dest string) (SnapshotInfo, error) {
 	if err != nil {
 		return SnapshotInfo{}, err
 	}
-	created := s.now().UTC().Truncate(time.Second)
 	info := SnapshotInfo{Path: dest, Root: root, CreatedAt: created, Nodes: len(nodes)}
 	manifest := snapshotManifest{
 		Format: 1, Root: root, CreatedAt: created, Nodes: len(nodes),

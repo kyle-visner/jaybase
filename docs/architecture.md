@@ -22,9 +22,11 @@ data-key file and credential hashes are mounted as separate Docker secrets
 
 The service is intentionally single-writer. The current storage format is a
 linear Merkle chain with a mutable root ref, not a distributed consensus
-protocol. One process serializes writes with an in-process lock and atomically
-replaces refs only after a content-addressed node is durable. Do not run multiple
-Jaybase replicas against one volume.
+protocol. One process serializes writes with an in-process lock and holds an
+advisory volume lock at `.writer.lock`; a second process fails to open the same
+store. Refs are atomically replaced only after a content-addressed node is
+durable. Do not run multiple Jaybase replicas against one volume, including on a
+shared network filesystem whose locking behavior has not been proven.
 
 ## Write contract
 
@@ -51,6 +53,11 @@ directory sync.
 This ordering means a crash can leave an unreachable node, but cannot make the
 root reference a partially written node. Snapshots include all encrypted nodes
 and refs, so an unreachable node is retained for forensic recovery.
+
+At open, Jaybase verifies reachable history and builds lightweight in-memory
+indexes for event position and request identity. That startup work is linear in
+history size. It makes idempotent replay lookup constant-time and lets the read
+API load only the requested page instead of materializing the full history.
 
 ## Scaling boundary
 

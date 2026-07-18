@@ -49,13 +49,14 @@ arguments, source control, or request URLs.
 
 ## Host hardening checklist
 
-- Patch the host and container images regularly; Dependabot tracks image and
-  GitHub Actions updates in this repository.
+- Patch the host and container images regularly; Dependabot tracks Go modules,
+  container images, and GitHub Actions updates in this repository.
 - Permit inbound 80/443 and restricted administrative SSH only. Do not publish
   Jaybase port 8080.
 - Use full-disk encryption where the hosting provider supports it.
 - Send container logs to a restricted destination; Jaybase never logs bodies or
-  authorization headers.
+  authorization headers. Access logs include the authenticated principal ID and
+  role, or an explicit `unauthenticated` marker for rejected credentials.
 - Copy snapshots off-host after every backup and retain multiple generations.
 - Record the returned root in the off-host backup log. Alert if a previously
   observed root is no longer in the current history.

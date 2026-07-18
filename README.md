@@ -90,12 +90,15 @@ curl -fsS \
 
 ```go
 store, err := jaybase.OpenStore(".jaybase")
+if err != nil { /* handle error */ }
+defer store.Close()
 root, err := store.Append(jaybase.Context{Actor: "agent"}, jaybase.AppendOptions{
     Type: "business.fact", Command: "fact assert", Payload: fact,
 })
 ```
 
-`OpenStore` retains the original local key fallback for compatibility.
+`OpenStore` retains the original local key fallback for compatibility and takes
+an advisory single-writer lock at `.jaybase/.writer.lock` until `Close`.
 Long-running hosted processes should use `OpenStoreWithDataKey`; the bundled
 server enforces that choice.
 
