@@ -301,6 +301,12 @@ func TestBDDIncrementalEventReplayKeepsTheFirstRootAsItsBoundary(t *testing.T) {
 		t.Fatalf("replay did not stop at captured target %s: %#v", target, applied)
 	}
 
+	caughtUpPath := "/v1/events?after=" + roots[5] + "&limit=3"
+	caughtUp := decodePage(api.request(t, http.MethodGet, caughtUpPath, api.tokens["reader-agent"], "", ""))
+	if len(caughtUp.Events) != 0 || caughtUp.Root != roots[5] || caughtUp.HasMore {
+		t.Fatalf("current-root checkpoint did not terminate with an empty page: %#v", caughtUp)
+	}
+
 	missing := api.request(t, http.MethodGet, "/v1/events?after=sha256:missing", api.tokens["reader-agent"], "", "")
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("unknown checkpoint status=%d body=%s", missing.Code, missing.Body.String())

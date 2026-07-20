@@ -64,15 +64,20 @@ concurrent append can therefore change both values on a later page.
 
 For a concurrency-safe incremental replay:
 
-1. Request the first page after the client's cached root and capture that
-   response's `root` as the target replay boundary.
-2. Apply events in order. If an event's hash equals the captured target, stop
-   immediately; do not apply later events from the same response.
-3. Until the target is reached, request another page with the final applied
+1. Request the first page after the client's checkpoint—the hash of the last
+   event it fully applied—and capture that response's `root` as the target
+   replay boundary. Omit `after` for a cold replay.
+2. If the first response has no events, stop before entering the pagination
+   loop. The client is already caught up when `root` equals its checkpoint; an
+   empty store likewise returns an empty target and no events.
+3. Otherwise, apply events in order. If an event's hash equals the captured
+   target, stop immediately; do not apply later events from the same response.
+4. Until the target is reached, request another page with the final applied
    event hash as `after`. Later responses may report a newer `root`; keep the
    original target.
-4. If the first response has no events and its `root` equals the cached root,
-   the client is already caught up. An empty store likewise has an empty target.
+5. After reaching the target, persist that target (equivalently, the last
+   applied event hash) as the new client checkpoint. Never persist a newer root
+   reported by a later page unless the client also applied through that event.
 
 Jaybase's history is a linear append-only chain, so the captured target remains
 reachable when a concurrent writer advances the live root. A cached `after`

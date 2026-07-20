@@ -303,6 +303,14 @@ func TestBDDIncrementalReplayStopsAtCapturedRootWhenLiveRootAdvances(t *testing.
 			t.Fatalf("applied event %d = %s, want %s", i, hash, roots[i])
 		}
 	}
+
+	caughtUp, err := store.EventPage(roots[5], 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caughtUp.Nodes) != 0 || caughtUp.Root != roots[5] || caughtUp.HasMore {
+		t.Fatalf("current-root checkpoint did not terminate with an empty page: %#v", caughtUp)
+	}
 }
 
 func TestBDDRequestIndexRebuildsAndAvoidsHistoryScanOnReplay(t *testing.T) {
