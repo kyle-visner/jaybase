@@ -3,6 +3,8 @@ package jaybase
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -95,5 +97,63 @@ func TestContainsRootDetectsMissingHistoryPin(t *testing.T) {
 	missing := "sha256:" + strings.Repeat("0", 64)
 	if present, err := store.ContainsRoot(missing); err != nil || present {
 		t.Fatalf("missing root present: present=%v err=%v", present, err)
+	}
+}
+
+func TestVerifyAllPreservesKnownRootOnMidHistoryFailure(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, err := store.Append(Context{Actor: "writer"}, AppendOptions{Type: "fact", Command: "remember", Payload: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Append(Context{Actor: "writer"}, AppendOptions{Type: "fact", Command: "remember", Payload: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptNode(t, store, second)
+	root, nodes, err := store.VerifyAll()
+	if err == nil || root != second || nodes != 1 {
+		t.Fatalf("failed verify root=%q nodes=%d err=%v; first=%q", root, nodes, err, first)
+	}
+}
+
+func TestMigrateDataKeyRemovesIncompleteDestinationOnFailure(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Append(Context{Actor: "writer"}, AppendOptions{Type: "fact", Command: "remember", Payload: 1}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Append(Context{Actor: "writer"}, AppendOptions{Type: "fact", Command: "remember", Payload: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptNode(t, store, second)
+	destination := filepath.Join(t.TempDir(), "partial")
+	newKey := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("n", 32)))
+	if _, err := store.MigrateDataKey(destination, newKey); err == nil {
+		t.Fatal("expected corrupt source migration to fail")
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete destination remains: err=%v", err)
+	}
+}
+
+func corruptNode(t *testing.T, store *Store, hash string) {
+	t.Helper()
+	path := store.NodePath(hash)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := strings.Replace(string(raw), "ciphertext", "ciphertexu", 1)
+	if err := os.WriteFile(path, []byte(corrupt), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -422,6 +422,20 @@ func TestMinimumRootReadinessAndAdminCheckDetectRollback(t *testing.T) {
 	if response := api.request(t, http.MethodGet, "/v1/admin/check-root?root="+missing, api.tokens["admin-agent"], "", ""); response.Code != http.StatusConflict {
 		t.Fatalf("missing check-root status=%d body=%s", response.Code, response.Body.String())
 	}
+	appendBody := fmt.Sprintf(`{"type":"fact","command":"remember","payload":true,"expected_root":%q}`, root)
+	if response := api.request(t, http.MethodPost, "/v1/events", api.tokens["writer-agent"], "rollback-blocked", appendBody); response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"integrity_error"`) {
+		t.Fatalf("rollback append status=%d body=%s", response.Code, response.Body.String())
+	}
+	refBody := fmt.Sprintf(`{"root":%q,"expected_root":""}`, root)
+	if response := api.request(t, http.MethodPut, "/v1/refs/rollback-blocked", api.tokens["writer-agent"], "", refBody); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("rollback ref status=%d body=%s", response.Code, response.Body.String())
+	}
+	if current, err := api.store.CurrentRoot(); err != nil || current != root {
+		t.Fatalf("blocked mutation changed root: root=%q err=%v", current, err)
+	}
+	if response := api.request(t, http.MethodGet, "/v1/events", api.tokens["reader-agent"], "", ""); response.Code != http.StatusOK {
+		t.Fatalf("rollback investigation read status=%d body=%s", response.Code, response.Body.String())
+	}
 }
 
 func TestPerPrincipalAndFailedAuthRateLimits(t *testing.T) {

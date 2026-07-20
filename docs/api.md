@@ -17,7 +17,9 @@ time. Neither route exposes data or requires authentication; the admin verify
 route performs the full history and decryption check. A failed readiness check
 returns `503` with `status: "not_ready"` and an `integrity_error`.
 When `JAYBASE_MINIMUM_ROOT` is set, readiness also requires that independently
-pinned root to remain in live history.
+pinned root to remain in live history. Event appends and named-ref updates enforce
+the same pin inside the authenticated handler and return `503 integrity_error`
+when it is absent; protection does not depend only on external health routing.
 
 ## Root
 

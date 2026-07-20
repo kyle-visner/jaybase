@@ -23,7 +23,7 @@ type KeyMigrationInfo struct {
 // history to a new, previously nonexistent directory using newEncodedKey. The
 // source is held read-only for the duration. Callers must keep the service
 // offline so the returned destination is a complete cutover point.
-func (s *Store) MigrateDataKey(destinationDir, newEncodedKey string) (KeyMigrationInfo, error) {
+func (s *Store) MigrateDataKey(destinationDir, newEncodedKey string) (result KeyMigrationInfo, returnErr error) {
 	sourceAbs, err := filepath.Abs(s.dir)
 	if err != nil {
 		return KeyMigrationInfo{}, err
@@ -51,11 +51,36 @@ func (s *Store) MigrateDataKey(destinationDir, newEncodedKey string) (KeyMigrati
 		return KeyMigrationInfo{}, appErr(ErrIntegrity, "current root does not match the in-memory history index")
 	}
 
-	destination, err := OpenStoreWithDataKey(destinationAbs, newEncodedKey)
+	if err := os.MkdirAll(filepath.Dir(destinationAbs), 0o700); err != nil {
+		return KeyMigrationInfo{}, err
+	}
+	if err := os.Mkdir(destinationAbs, 0o700); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return KeyMigrationInfo{}, appErr(ErrConflict, "destination already exists")
+		}
+		return KeyMigrationInfo{}, err
+	}
+	cleanupDestination := true
+	var destination *Store
+	destinationOpen := false
+	defer func() {
+		if destinationOpen {
+			if err := destination.Close(); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("close incomplete destination: %w", err))
+			}
+		}
+		if cleanupDestination {
+			if err := os.RemoveAll(destinationAbs); err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("remove incomplete destination %s: %w", destinationAbs, err))
+			}
+		}
+	}()
+
+	destination, err = OpenStoreWithDataKey(destinationAbs, newEncodedKey)
 	if err != nil {
 		return KeyMigrationInfo{}, fmt.Errorf("open destination store: %w", err)
 	}
-	defer destination.Close()
+	destinationOpen = true
 
 	rootMap := make(map[string]string, len(s.history))
 	newRoot := ""
@@ -103,8 +128,15 @@ func (s *Store) MigrateDataKey(destinationDir, newEncodedKey string) (KeyMigrati
 		namedRefs++
 	}
 
-	return KeyMigrationInfo{
+	result = KeyMigrationInfo{
 		SourceRoot: sourceRoot, DestinationRoot: newRoot,
 		Nodes: len(s.history), NamedRefs: namedRefs, HashMap: rootMap,
-	}, nil
+	}
+	if err := destination.Close(); err != nil {
+		destinationOpen = false
+		return KeyMigrationInfo{}, fmt.Errorf("close destination store: %w", err)
+	}
+	destinationOpen = false
+	cleanupDestination = false
+	return result, nil
 }

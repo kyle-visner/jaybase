@@ -320,10 +320,10 @@ func (s *Store) VerifyAll() (root string, nodes int, err error) {
 	for _, hash := range s.history {
 		node, readErr := s.readNode(hash)
 		if readErr != nil {
-			return "", nodes, readErr
+			return root, nodes, readErr
 		}
 		if _, payloadErr := s.nodePayload(node); payloadErr != nil {
-			return "", nodes, payloadErr
+			return root, nodes, payloadErr
 		}
 		nodes++
 	}

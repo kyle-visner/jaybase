@@ -65,7 +65,10 @@ curl -fsS -G \
 
 Set `JAYBASE_MINIMUM_ROOT` to the last off-host pin and recreate Jaybase when
 readiness should enforce the same condition. Advance it only after exporting and
-verifying the corresponding snapshot.
+verifying the corresponding snapshot. When the pin is absent, Jaybase rejects
+event appends and named-ref updates with `503 integrity_error` even if traffic can
+still reach the process; reads and admin verification remain available for
+forensic investigation.
 
 Use a scheduler on the host or in an external automation system to trigger and
 export snapshots. Do not place the admin token directly in a crontab; read it
@@ -140,10 +143,12 @@ ciphertext means every node hash changes, including roots held by named refs.
    Retain the source read-only under incident policy and remove temporary key
    files using the secret-manager procedure.
 
-If migration fails, retain the error, discard the incomplete destination, and
-retry into another nonexistent directory. Re-encryption limits future exposure;
-it cannot undo access to the compromised old key. A KMS/HSM should unwrap into
-the existing read-only key-file mount, never onto the data volume.
+If migration fails, retain the error. Jaybase closes and removes the destination
+it created before returning; a cleanup failure is joined into the reported error
+with the exact remaining path. Retry into a nonexistent directory only after
+confirming that path is absent. Re-encryption limits future exposure; it cannot
+undo access to the compromised old key. A KMS/HSM should unwrap into the existing
+read-only key-file mount, never onto the data volume.
 
 ## Restore drill
 

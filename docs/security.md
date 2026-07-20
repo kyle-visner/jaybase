@@ -91,8 +91,10 @@ curl -fsS -G \
 The endpoint returns `200` only when the pin is the live root or an ancestor and
 `409 integrity_error` when absent. Set `JAYBASE_MINIMUM_ROOT` to the last
 independently retained pin and recreate Jaybase to make an absent pin fail
-readiness with `503`. Alert before allowing writes. Never keep the only pin on
-the Jaybase volume.
+readiness with `503`. Event appends and named-ref updates also fail closed with
+`503` while the pin is absent, even if a client bypasses health-aware routing.
+Reads and verification remain available for investigation. Alert before allowing
+writes. Never keep the only pin on the Jaybase volume.
 
 ## Host hardening checklist
 

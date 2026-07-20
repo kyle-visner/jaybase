@@ -200,12 +200,18 @@ func AddToken(path, id, role, token string, notAfter *time.Time) error {
 		}
 	}
 	sum := sha256.Sum256([]byte(token))
+	digest := hex.EncodeToString(sum[:])
+	for _, record := range file.Tokens {
+		if strings.EqualFold(strings.TrimSpace(record.SHA256), digest) {
+			return fmt.Errorf("token digest already exists")
+		}
+	}
 	if notAfter != nil {
 		value := notAfter.UTC()
 		notAfter = &value
 	}
 	file.Tokens = append(file.Tokens, credentialRecord{
-		ID: id, Role: parsedRole.String(), SHA256: hex.EncodeToString(sum[:]), NotAfter: notAfter,
+		ID: id, Role: parsedRole.String(), SHA256: digest, NotAfter: notAfter,
 	})
 	return writeCredentialFile(path, file)
 }
@@ -232,8 +238,16 @@ func RevokeToken(path, id string) error {
 	if !found {
 		return fmt.Errorf("credential id %q was not found", id)
 	}
-	if len(filtered) == 0 {
-		return fmt.Errorf("refusing to revoke the final credential")
+	now := time.Now().UTC()
+	active := false
+	for _, record := range filtered {
+		if record.NotAfter == nil || now.Before(record.NotAfter.UTC()) {
+			active = true
+			break
+		}
+	}
+	if !active {
+		return fmt.Errorf("refusing to revoke the final active credential")
 	}
 	file.Tokens = filtered
 	return writeCredentialFile(path, file)

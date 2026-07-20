@@ -53,6 +53,19 @@ func TestAddAndRevokeTokenUpdateAuthFileWithoutPlaintext(t *testing.T) {
 	if err := os.WriteFile(path, contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := AddToken(path, "duplicate-token", "reader", initial, nil); err == nil {
+		t.Fatal("expected duplicate token digest to be rejected")
+	}
+	unchanged, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unchanged) != string(contents) {
+		t.Fatalf("duplicate digest changed auth file: %s", unchanged)
+	}
+	if _, err := LoadAuthenticator(path); err != nil {
+		t.Fatalf("duplicate rejection left auth file unloadable: %v", err)
+	}
 	added := strings.Repeat("n", 64)
 	expires := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	if err := AddToken(path, "reader-agent", "reader", added, &expires); err != nil {
@@ -85,5 +98,36 @@ func TestAddAndRevokeTokenUpdateAuthFileWithoutPlaintext(t *testing.T) {
 	}
 	if err := RevokeToken(path, "reader-agent"); err == nil {
 		t.Fatal("expected final credential revocation to be refused")
+	}
+}
+
+func TestRevokeTokenRefusesToLeaveOnlyExpiredCredentials(t *testing.T) {
+	activeToken := strings.Repeat("a", 64)
+	expiredToken := strings.Repeat("e", 64)
+	digest := func(token string) string {
+		sum := sha256.Sum256([]byte(token))
+		return hex.EncodeToString(sum[:])
+	}
+	expired := time.Now().UTC().Add(-time.Hour)
+	contents, err := json.Marshal(map[string]any{"tokens": []any{
+		map[string]any{"id": "expired", "role": "admin", "sha256": digest(expiredToken), "not_after": expired},
+		map[string]any{"id": "active", "role": "admin", "sha256": digest(activeToken)},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RevokeToken(path, "active"); err == nil || !strings.Contains(err.Error(), "final active credential") {
+		t.Fatalf("last-active revocation error = %v", err)
+	}
+	auth, err := LoadAuthenticator(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if principal, ok := auth.Authenticate(activeToken); !ok || principal.ID != "active" {
+		t.Fatalf("active credential lost after refused revoke: principal=%#v ok=%v", principal, ok)
 	}
 }

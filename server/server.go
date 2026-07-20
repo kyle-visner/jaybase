@@ -105,9 +105,9 @@ func (a *API) routes() {
 	a.mux.HandleFunc("GET /health/ready", a.ready)
 	a.mux.Handle("GET /v1/root", a.require(RoleReader, http.HandlerFunc(a.root)))
 	a.mux.Handle("GET /v1/events", a.require(RoleReader, http.HandlerFunc(a.events)))
-	a.mux.Handle("POST /v1/events", a.require(RoleWriter, http.HandlerFunc(a.appendEvent)))
+	a.mux.Handle("POST /v1/events", a.requireMutation(RoleWriter, http.HandlerFunc(a.appendEvent)))
 	a.mux.Handle("GET /v1/refs/{name}", a.require(RoleReader, http.HandlerFunc(a.getNamedRef)))
-	a.mux.Handle("PUT /v1/refs/{name}", a.require(RoleWriter, http.HandlerFunc(a.putNamedRef)))
+	a.mux.Handle("PUT /v1/refs/{name}", a.requireMutation(RoleWriter, http.HandlerFunc(a.putNamedRef)))
 	a.mux.Handle("POST /v1/admin/snapshots", a.require(RoleAdmin, http.HandlerFunc(a.snapshot)))
 	a.mux.Handle("POST /v1/admin/verify", a.require(RoleAdmin, http.HandlerFunc(a.verify)))
 	a.mux.Handle("GET /v1/admin/check-root", a.require(RoleAdmin, http.HandlerFunc(a.checkRoot)))
@@ -125,15 +125,13 @@ func (a *API) ready(w http.ResponseWriter, _ *http.Request) {
 		})
 		return
 	}
-	if a.minimumRoot != "" {
-		contains, err := a.store.ContainsRoot(a.minimumRoot)
-		if err != nil || !contains {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-				"status": "not_ready",
-				"error":  jaybase.AppError{Code: jaybase.ErrIntegrity, Message: "configured minimum root is absent from live history"},
-			})
-			return
-		}
+	contains, err := a.minimumRootPresent()
+	if err != nil || !contains {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not_ready",
+			"error":  jaybase.AppError{Code: jaybase.ErrIntegrity, Message: "configured minimum root is absent from live history"},
+		})
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
@@ -425,6 +423,24 @@ func (a *API) require(minimum Role, next http.Handler) http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal))
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (a *API) requireMutation(minimum Role, next http.Handler) http.Handler {
+	return a.require(minimum, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contains, err := a.minimumRootPresent()
+		if err != nil || !contains {
+			writeError(w, http.StatusServiceUnavailable, jaybase.ErrIntegrity, "configured minimum root is absent from live history")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
+}
+
+func (a *API) minimumRootPresent() (bool, error) {
+	if a.minimumRoot == "" {
+		return true, nil
+	}
+	return a.store.ContainsRoot(a.minimumRoot)
 }
 
 func principalFromContext(ctx context.Context) Principal {
