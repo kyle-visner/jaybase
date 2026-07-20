@@ -57,8 +57,34 @@ Query parameters:
 - `include_payload=true`: decrypt and include payloads. Payloads are omitted by
   default.
 
-The response includes `events`, the current `root`, and `has_more`. Continue by
-passing the final returned event hash as `after`.
+The response includes `events`, the current `root`, and `has_more`. The `root`
+is the live history tip captured atomically with that page. `has_more` says
+whether more events followed the returned page at the time of that request; a
+concurrent append can therefore change both values on a later page.
+
+For a concurrency-safe incremental replay:
+
+1. Request the first page after the client's checkpoint—the hash of the last
+   event it fully applied—and capture that response's `root` as the target
+   replay boundary. Omit `after` for a cold replay.
+2. If the first response has no events, stop before entering the pagination
+   loop. The client is already caught up when `root` equals its checkpoint; an
+   empty store likewise returns an empty target and no events.
+3. Otherwise, apply events in order. If an event's hash equals the captured
+   target, stop immediately; do not apply later events from the same response.
+4. Until the target is reached, request another page with the final applied
+   event hash as `after`. Later responses may report a newer `root`; keep the
+   original target.
+5. After reaching the target, persist that target (equivalently, the last
+   applied event hash) as the new client checkpoint. Never persist a newer root
+   reported by a later page unless the client also applied through that event.
+
+Jaybase's history is a linear append-only chain, so the captured target remains
+reachable when a concurrent writer advances the live root. A cached `after`
+hash that is not in the current history returns structured `404 not_found`; the
+client must invalidate that checkpoint and perform a cold replay. This can
+happen after restoring or replacing a store. Payload omission and
+`include_payload=true` behave identically during bounded replay.
 
 ## Named refs
 

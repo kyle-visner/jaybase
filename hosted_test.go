@@ -238,6 +238,81 @@ func TestBDDEventPageReadsOnlyTheRequestedWindow(t *testing.T) {
 	}
 }
 
+func TestBDDIncrementalReplayStopsAtCapturedRootWhenLiveRootAdvances(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var roots []string
+	appendEvent := func(sequence int) {
+		t.Helper()
+		root, err := store.Append(Context{Actor: "writer"}, AppendOptions{
+			Type: "fact", Command: "remember", Payload: map[string]int{"sequence": sequence},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	for i := 0; i < 4; i++ {
+		appendEvent(i)
+	}
+
+	first, err := store.EventPage("", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := first.Root
+	if target != roots[3] || len(first.Nodes) != 3 || !first.HasMore {
+		t.Fatalf("unexpected first page: %#v", first)
+	}
+
+	// Model another writer advancing the live root between page requests.
+	appendEvent(4)
+	appendEvent(5)
+	second, err := store.EventPage(first.Nodes[len(first.Nodes)-1].Hash, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Root != roots[5] || len(second.Nodes) != 3 || second.HasMore {
+		t.Fatalf("unexpected second page after concurrent appends: %#v", second)
+	}
+
+	applied := make([]string, 0, 4)
+	for _, node := range first.Nodes {
+		applied = append(applied, node.Hash)
+	}
+	reachedTarget := false
+	for _, node := range second.Nodes {
+		applied = append(applied, node.Hash)
+		if node.Hash == target {
+			reachedTarget = true
+			break
+		}
+	}
+	if !reachedTarget {
+		t.Fatalf("captured target %s was not reachable in the advanced history", target)
+	}
+	if len(applied) != 4 {
+		t.Fatalf("applied events beyond captured target: %#v", applied)
+	}
+	for i, hash := range applied {
+		if hash != roots[i] {
+			t.Fatalf("applied event %d = %s, want %s", i, hash, roots[i])
+		}
+	}
+
+	caughtUp, err := store.EventPage(roots[5], 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caughtUp.Nodes) != 0 || caughtUp.Root != roots[5] || caughtUp.HasMore {
+		t.Fatalf("current-root checkpoint did not terminate with an empty page: %#v", caughtUp)
+	}
+}
+
 func TestBDDRequestIndexRebuildsAndAvoidsHistoryScanOnReplay(t *testing.T) {
 	dir := t.TempDir()
 	store, err := OpenStore(dir)

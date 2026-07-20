@@ -43,20 +43,42 @@ Content-Type: application/json
 
 1. Confirm availability with `GET /health/ready`. This route needs no token and
    discloses no facts.
-2. Fetch `GET /v1/root` and retain the returned root for any dependent write.
-3. Read events with `GET /v1/events?limit=100`.
+2. For a dependent write, fetch `GET /v1/root` and retain that live root as the
+   write's `expected_root`. It is not the incremental replay cursor.
+3. The replay cursor is the hash of the last event this client fully applied in
+   a prior session. Read with `GET /v1/events?after=<last-applied-hash>&limit=100`,
+   omitting `after` for a cold replay. Capture this first response's `root` as
+   the target replay boundary.
 4. Payloads are omitted by default. Add `include_payload=true` only when the task
    requires decrypted content.
-5. If `has_more` is true, take the final event's `hash` and request the next page
-   with `after=<hash>`. Continue until `has_more` is false.
+5. If the first response has no events, stop before requesting another page. The
+   client is already caught up when the response root equals its cursor; an
+   empty store likewise returns an empty root and no events.
+6. Otherwise, apply events in order and stop immediately when an event's hash
+   equals the captured target. Do not apply newer events that follow it in the
+   same page.
+7. Until the target is reached, take the final applied event's `hash` and request
+   the next page with `after=<hash>`. Keep the original target even if a later
+   response reports a newer `root` or different `has_more` value.
+8. After reaching the target, persist it as the new replay cursor. Never persist
+   a newer root reported by a later page unless every event through it was
+   applied.
 
 Example:
 
 ```sh
 curl -fsS \
   -H "Authorization: Bearer $JAYBASE_TOKEN" \
-  "$JAYBASE_URL/v1/events?after=$LAST_HASH&limit=100&include_payload=true"
+  "$JAYBASE_URL/v1/events?after=$LAST_APPLIED_HASH&limit=100&include_payload=true"
 ```
+
+Each response's `root` is the live history tip captured with that page, and
+`has_more` is relative to that individual request. The first response's root is
+the stable catch-up boundary because later appends extend the same linear
+history. If the first page is empty and its root equals the replay cursor, no
+catch-up is needed. If the cached `after` hash returns structured
+`404 not_found`, discard the checkpoint and replay from the beginning; a store
+restore or replacement may have selected a different history.
 
 Do not treat the last event for an entity as current state unless the domain's
 replay rules say that is correct. Corrections, retractions, approvals, and

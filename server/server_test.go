@@ -225,6 +225,103 @@ func TestBDDEventEndpointHonorsThePageLimitBeforeReadingHistory(t *testing.T) {
 	}
 }
 
+func TestBDDIncrementalEventReplayKeepsTheFirstRootAsItsBoundary(t *testing.T) {
+	api := newTestAPI(t)
+	var roots []string
+	appendEvent := func(sequence int) {
+		t.Helper()
+		root, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+			Type: "fact", Command: "remember", Payload: map[string]int{"sequence": sequence},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	for i := 0; i < 4; i++ {
+		appendEvent(i)
+	}
+
+	type replayResponse struct {
+		Events []struct {
+			Hash    string          `json:"hash"`
+			Payload json.RawMessage `json:"payload"`
+		} `json:"events"`
+		Root    string `json:"root"`
+		HasMore bool   `json:"has_more"`
+	}
+	decodePage := func(response *httptest.ResponseRecorder) replayResponse {
+		t.Helper()
+		if response.Code != http.StatusOK {
+			t.Fatalf("event page status=%d body=%s", response.Code, response.Body.String())
+		}
+		var page replayResponse
+		if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+
+	first := decodePage(api.request(t, http.MethodGet, "/v1/events?limit=3", api.tokens["reader-agent"], "", ""))
+	target := first.Root
+	if target != roots[3] || len(first.Events) != 3 || !first.HasMore {
+		t.Fatalf("unexpected first page: %#v", first)
+	}
+	for _, event := range first.Events {
+		if len(event.Payload) != 0 {
+			t.Fatalf("metadata-only page exposed a payload: %#v", event)
+		}
+	}
+
+	// Model another writer advancing the live root between HTTP page requests.
+	appendEvent(4)
+	appendEvent(5)
+	path := "/v1/events?after=" + first.Events[len(first.Events)-1].Hash + "&limit=3&include_payload=true"
+	second := decodePage(api.request(t, http.MethodGet, path, api.tokens["reader-agent"], "", ""))
+	if second.Root != roots[5] || len(second.Events) != 3 || second.HasMore {
+		t.Fatalf("unexpected second page after concurrent appends: %#v", second)
+	}
+
+	applied := make([]string, 0, 4)
+	for _, event := range first.Events {
+		applied = append(applied, event.Hash)
+	}
+	reachedTarget := false
+	for _, event := range second.Events {
+		if len(event.Payload) == 0 {
+			t.Fatalf("include_payload page omitted a payload: %#v", event)
+		}
+		applied = append(applied, event.Hash)
+		if event.Hash == target {
+			reachedTarget = true
+			break
+		}
+	}
+	if !reachedTarget || len(applied) != 4 {
+		t.Fatalf("replay did not stop at captured target %s: %#v", target, applied)
+	}
+
+	caughtUpPath := "/v1/events?after=" + roots[5] + "&limit=3"
+	caughtUp := decodePage(api.request(t, http.MethodGet, caughtUpPath, api.tokens["reader-agent"], "", ""))
+	if len(caughtUp.Events) != 0 || caughtUp.Root != roots[5] || caughtUp.HasMore {
+		t.Fatalf("current-root checkpoint did not terminate with an empty page: %#v", caughtUp)
+	}
+
+	missing := api.request(t, http.MethodGet, "/v1/events?after=sha256:missing", api.tokens["reader-agent"], "", "")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("unknown checkpoint status=%d body=%s", missing.Code, missing.Body.String())
+	}
+	var failure struct {
+		Error jaybase.AppError `json:"error"`
+	}
+	if err := json.Unmarshal(missing.Body.Bytes(), &failure); err != nil {
+		t.Fatal(err)
+	}
+	if failure.Error.Code != jaybase.ErrNotFound {
+		t.Fatalf("unknown checkpoint error=%#v", failure.Error)
+	}
+}
+
 func TestBDDOversizedJSONReturnsOneStructured413(t *testing.T) {
 	api := newTestAPIWithOptions(t, func(options *Options) { options.MaxBodyBytes = 64 })
 	body := `{"type":"fact","command":"remember","payload":{"value":"` + strings.Repeat("x", 128) + `"},"expected_root":""}`

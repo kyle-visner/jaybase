@@ -61,8 +61,13 @@ type requestRecord struct {
 }
 
 type EventPage struct {
-	Nodes   []Node
-	Root    string
+	Nodes []Node
+	// Root is the current history tip captured atomically with this page. In the
+	// append-only linear history, a root captured from the first page remains a
+	// reachable replay boundary even if later page reads report a newer root.
+	Root string
+	// HasMore reports whether more events followed this page at the time of this
+	// read. A concurrent append can change it on a later request.
 	HasMore bool
 }
 
@@ -505,7 +510,10 @@ func (s *Store) AuditLog() ([]Node, error) {
 }
 
 // EventPage returns at most limit events in oldest-to-newest order without
-// materializing the complete history. The after hash is exclusive.
+// materializing the complete history. The after hash is exclusive. Root and
+// Nodes are read under the same lock, so clients can capture the first page's
+// Root and stop exactly when that event is reached even if concurrent appends
+// advance the root between page requests.
 func (s *Store) EventPage(after string, limit int) (EventPage, error) {
 	if limit < 1 {
 		return EventPage{}, appErr(ErrValidation, "event page limit must be positive")
