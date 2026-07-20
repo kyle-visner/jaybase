@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,10 +38,16 @@ func main() {
 		err = healthcheck()
 	case "hash-token":
 		err = hashToken()
+	case "add-token":
+		err = addToken()
+	case "revoke-token":
+		err = revokeToken()
+	case "migrate-key":
+		err = migrateKey()
 	case "init":
 		err = initSecrets()
 	default:
-		err = fmt.Errorf("unknown command %q (expected serve, healthcheck, hash-token, or init)", command)
+		err = fmt.Errorf("unknown command %q (expected serve, healthcheck, hash-token, add-token, revoke-token, migrate-key, or init)", command)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "jaybase-server:", err)
@@ -80,9 +87,19 @@ func serve() error {
 	if err != nil {
 		return err
 	}
+	rateLimit, err := envInt("JAYBASE_RATE_LIMIT_PER_MINUTE", 600)
+	if err != nil {
+		return err
+	}
+	failedAuthLimit, err := envInt("JAYBASE_FAILED_AUTH_LIMIT_PER_MINUTE", 30)
+	if err != nil {
+		return err
+	}
 	api, err := server.New(server.Options{
 		Store: store, Auth: auth, BackupDir: strings.TrimSpace(os.Getenv("JAYBASE_BACKUP_DIR")), Logger: logger,
 		SnapshotRetention: snapshotRetention, SnapshotMinFreeBytes: snapshotMinFreeBytes,
+		MinimumRoot:        strings.TrimSpace(os.Getenv("JAYBASE_MINIMUM_ROOT")),
+		RateLimitPerMinute: rateLimit, FailedAuthLimitPerMinute: failedAuthLimit,
 	})
 	if err != nil {
 		return err
@@ -178,6 +195,67 @@ func hashToken() error {
 	sum := sha256.Sum256([]byte(token))
 	fmt.Println(hex.EncodeToString(sum[:]))
 	return nil
+}
+
+func addToken() error {
+	if len(os.Args) < 5 || len(os.Args) > 6 {
+		return fmt.Errorf("usage: jaybase-server add-token AUTH_FILE ID ROLE [NOT_AFTER_RFC3339]")
+	}
+	var notAfter *time.Time
+	if len(os.Args) == 6 {
+		parsed, err := time.Parse(time.RFC3339, os.Args[5])
+		if err != nil {
+			return fmt.Errorf("NOT_AFTER must be RFC3339: %w", err)
+		}
+		notAfter = &parsed
+	}
+	token, err := randomToken()
+	if err != nil {
+		return err
+	}
+	if err := server.AddToken(os.Args[2], os.Args[3], os.Args[4], token, notAfter); err != nil {
+		return err
+	}
+	fmt.Printf("%s=%s\n", os.Args[3], token)
+	fmt.Fprintln(os.Stderr, "Token added. Store the plaintext in a password manager, then recreate the service to load the updated auth file.")
+	return nil
+}
+
+func revokeToken() error {
+	if len(os.Args) != 4 {
+		return fmt.Errorf("usage: jaybase-server revoke-token AUTH_FILE ID")
+	}
+	if err := server.RevokeToken(os.Args[2], os.Args[3]); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr, "Token revoked. Recreate the service to load the updated auth file.")
+	return nil
+}
+
+func migrateKey() error {
+	if len(os.Args) != 6 {
+		return fmt.Errorf("usage: jaybase-server migrate-key SOURCE_DIR DESTINATION_DIR OLD_KEY_FILE NEW_KEY_FILE")
+	}
+	oldKey, err := os.ReadFile(os.Args[4])
+	if err != nil {
+		return fmt.Errorf("read old key file: %w", err)
+	}
+	newKey, err := os.ReadFile(os.Args[5])
+	if err != nil {
+		return fmt.Errorf("read new key file: %w", err)
+	}
+	store, err := jaybase.OpenStoreWithDataKey(os.Args[2], strings.TrimSpace(string(oldKey)))
+	if err != nil {
+		return fmt.Errorf("open source store: %w", err)
+	}
+	defer store.Close()
+	result, err := store.MigrateDataKey(os.Args[3], strings.TrimSpace(string(newKey)))
+	if err == nil || result.HashMap != nil {
+		if encodeErr := json.NewEncoder(os.Stdout).Encode(result); encodeErr != nil {
+			return errors.Join(err, encodeErr)
+		}
+	}
+	return err
 }
 
 func initSecrets() error {

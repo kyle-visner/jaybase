@@ -363,12 +363,23 @@ func TestBDDIntegrityFailureUsesServerErrorAndNotReadyStatus(t *testing.T) {
 
 func TestBDDAccessLogsAttributeAuthenticatedAndRejectedRequests(t *testing.T) {
 	api := newTestAPI(t)
+	if _, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]bool{"sensitive": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	validToken := api.tokens["reader-agent"]
 	if response := api.request(t, http.MethodGet, "/v1/root", validToken, "", ""); response.Code != http.StatusOK {
 		t.Fatalf("authenticated request status=%d", response.Code)
 	}
 	if response := api.request(t, http.MethodGet, "/v1/root", "invalid-token-that-is-long-enough-000000", "", ""); response.Code != http.StatusUnauthorized {
 		t.Fatalf("rejected request status=%d", response.Code)
+	}
+	if response := api.request(t, http.MethodGet, "/v1/events?include_payload=true&limit=25", validToken, "", ""); response.Code != http.StatusOK {
+		t.Fatalf("payload read status=%d", response.Code)
+	}
+	if response := api.request(t, http.MethodGet, "/v1/events?include_payload=true&limit=25&after=checkpoint", validToken, "", ""); response.Code != http.StatusNotFound {
+		t.Fatalf("audited read status=%d", response.Code)
 	}
 	logs := api.logs.String()
 	if !strings.Contains(logs, `"principal_id":"reader-agent"`) || !strings.Contains(logs, `"role":"reader"`) {
@@ -379,6 +390,82 @@ func TestBDDAccessLogsAttributeAuthenticatedAndRejectedRequests(t *testing.T) {
 	}
 	if strings.Contains(logs, validToken) {
 		t.Fatal("access log leaked a bearer token")
+	}
+	for _, field := range []string{`"include_payload":true`, `"payloads_decrypted":1`, `"payloads_decrypted":0`, `"limit":25`, `"after_present":true`} {
+		if !strings.Contains(logs, field) {
+			t.Fatalf("safe read field %s missing from logs: %s", field, logs)
+		}
+	}
+}
+
+func TestMinimumRootReadinessAndAdminCheckDetectRollback(t *testing.T) {
+	api := newTestAPI(t)
+	root, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.api.minimumRoot = root
+	if response := api.request(t, http.MethodGet, "/health/ready", "", "", ""); response.Code != http.StatusOK {
+		t.Fatalf("pinned readiness status=%d body=%s", response.Code, response.Body.String())
+	}
+	path := "/v1/admin/check-root?root=" + root
+	if response := api.request(t, http.MethodGet, path, api.tokens["admin-agent"], "", ""); response.Code != http.StatusOK {
+		t.Fatalf("check-root status=%d body=%s", response.Code, response.Body.String())
+	}
+	missing := "sha256:" + strings.Repeat("0", 64)
+	api.api.minimumRoot = missing
+	if response := api.request(t, http.MethodGet, "/health/ready", "", "", ""); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("missing pin readiness status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response := api.request(t, http.MethodGet, "/v1/admin/check-root?root="+missing, api.tokens["admin-agent"], "", ""); response.Code != http.StatusConflict {
+		t.Fatalf("missing check-root status=%d body=%s", response.Code, response.Body.String())
+	}
+	appendBody := fmt.Sprintf(`{"type":"fact","command":"remember","payload":true,"expected_root":%q}`, root)
+	if response := api.request(t, http.MethodPost, "/v1/events", api.tokens["writer-agent"], "rollback-blocked", appendBody); response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"integrity_error"`) {
+		t.Fatalf("rollback append status=%d body=%s", response.Code, response.Body.String())
+	}
+	refBody := fmt.Sprintf(`{"root":%q,"expected_root":""}`, root)
+	if response := api.request(t, http.MethodPut, "/v1/refs/rollback-blocked", api.tokens["writer-agent"], "", refBody); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("rollback ref status=%d body=%s", response.Code, response.Body.String())
+	}
+	if current, err := api.store.CurrentRoot(); err != nil || current != root {
+		t.Fatalf("blocked mutation changed root: root=%q err=%v", current, err)
+	}
+	if response := api.request(t, http.MethodGet, "/v1/events", api.tokens["reader-agent"], "", ""); response.Code != http.StatusOK {
+		t.Fatalf("rollback investigation read status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestPerPrincipalAndFailedAuthRateLimits(t *testing.T) {
+	api := newTestAPIWithOptions(t, func(options *Options) {
+		options.RateLimitPerMinute = 1
+		options.FailedAuthLimitPerMinute = 1
+	})
+	if response := api.request(t, http.MethodGet, "/v1/root", api.tokens["reader-agent"], "", ""); response.Code != http.StatusOK {
+		t.Fatalf("first authenticated status=%d", response.Code)
+	}
+	if response := api.request(t, http.MethodGet, "/v1/root", api.tokens["reader-agent"], "", ""); response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("authenticated limit status=%d headers=%v", response.Code, response.Header())
+	}
+	bad := "invalid-token-that-is-long-enough-000000"
+	if response := api.request(t, http.MethodGet, "/v1/root", bad, "", ""); response.Code != http.StatusUnauthorized {
+		t.Fatalf("first invalid status=%d", response.Code)
+	}
+	if response := api.request(t, http.MethodGet, "/v1/root", bad, "", ""); response.Code != http.StatusTooManyRequests {
+		t.Fatalf("failed auth limit status=%d", response.Code)
+	}
+}
+
+func TestDecodeErrorsDoNotExposeParserDetails(t *testing.T) {
+	api := newTestAPI(t)
+	response := api.request(t, http.MethodPost, "/v1/events", api.tokens["writer-agent"], "request-parse", `{"unknown_secret_field":`)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "exactly one valid JSON object") {
+		t.Fatalf("decode status=%d body=%s", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "unknown_secret_field") || strings.Contains(response.Body.String(), "unexpected EOF") {
+		t.Fatalf("decode error exposed parser detail: %s", response.Body.String())
 	}
 }
 

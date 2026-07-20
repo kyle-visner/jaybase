@@ -24,14 +24,19 @@ import (
 
 const defaultMaxBodyBytes int64 = 1 << 20
 const defaultSnapshotRetention = 24
+const defaultRateLimitPerMinute = 600
+const defaultFailedAuthLimitPerMinute = 30
 
 type Options struct {
-	Store             *jaybase.Store
-	Auth              *Authenticator
-	BackupDir         string
-	Logger            *slog.Logger
-	MaxBodyBytes      int64
-	SnapshotRetention int
+	Store                    *jaybase.Store
+	Auth                     *Authenticator
+	BackupDir                string
+	Logger                   *slog.Logger
+	MaxBodyBytes             int64
+	SnapshotRetention        int
+	MinimumRoot              string
+	RateLimitPerMinute       int
+	FailedAuthLimitPerMinute int
 	// SnapshotMinFreeBytes is the reserve preserved after the estimated archive;
 	// zero explicitly disables the reserve.
 	SnapshotMinFreeBytes uint64
@@ -45,6 +50,9 @@ type API struct {
 	maxBody              int64
 	snapshotRetention    int
 	snapshotMinFreeBytes uint64
+	minimumRoot          string
+	requestLimiter       *fixedWindowLimiter
+	failedAuthLimiter    *fixedWindowLimiter
 	availableBytes       func(string) (uint64, error)
 	pruneSnapshots       func(string, int) error
 	snapshotMu           sync.Mutex
@@ -69,11 +77,20 @@ func New(options Options) (*API, error) {
 	if options.SnapshotRetention <= 0 {
 		options.SnapshotRetention = defaultSnapshotRetention
 	}
+	if options.RateLimitPerMinute == 0 {
+		options.RateLimitPerMinute = defaultRateLimitPerMinute
+	}
+	if options.FailedAuthLimitPerMinute == 0 {
+		options.FailedAuthLimitPerMinute = defaultFailedAuthLimitPerMinute
+	}
 	api := &API{
 		store: options.Store, auth: options.Auth, backupDir: options.BackupDir,
 		logger: options.Logger, maxBody: options.MaxBodyBytes,
 		snapshotRetention: options.SnapshotRetention, snapshotMinFreeBytes: options.SnapshotMinFreeBytes,
-		availableBytes: diskAvailableBytes, pruneSnapshots: pruneSnapshots, mux: http.NewServeMux(),
+		minimumRoot:       strings.TrimSpace(options.MinimumRoot),
+		requestLimiter:    newFixedWindowLimiter(options.RateLimitPerMinute, time.Minute),
+		failedAuthLimiter: newFixedWindowLimiter(options.FailedAuthLimitPerMinute, time.Minute),
+		availableBytes:    diskAvailableBytes, pruneSnapshots: pruneSnapshots, mux: http.NewServeMux(),
 	}
 	api.routes()
 	return api, nil
@@ -88,11 +105,12 @@ func (a *API) routes() {
 	a.mux.HandleFunc("GET /health/ready", a.ready)
 	a.mux.Handle("GET /v1/root", a.require(RoleReader, http.HandlerFunc(a.root)))
 	a.mux.Handle("GET /v1/events", a.require(RoleReader, http.HandlerFunc(a.events)))
-	a.mux.Handle("POST /v1/events", a.require(RoleWriter, http.HandlerFunc(a.appendEvent)))
+	a.mux.Handle("POST /v1/events", a.requireMutation(RoleWriter, http.HandlerFunc(a.appendEvent)))
 	a.mux.Handle("GET /v1/refs/{name}", a.require(RoleReader, http.HandlerFunc(a.getNamedRef)))
-	a.mux.Handle("PUT /v1/refs/{name}", a.require(RoleWriter, http.HandlerFunc(a.putNamedRef)))
+	a.mux.Handle("PUT /v1/refs/{name}", a.requireMutation(RoleWriter, http.HandlerFunc(a.putNamedRef)))
 	a.mux.Handle("POST /v1/admin/snapshots", a.require(RoleAdmin, http.HandlerFunc(a.snapshot)))
 	a.mux.Handle("POST /v1/admin/verify", a.require(RoleAdmin, http.HandlerFunc(a.verify)))
+	a.mux.Handle("GET /v1/admin/check-root", a.require(RoleAdmin, http.HandlerFunc(a.checkRoot)))
 }
 
 func (a *API) live(w http.ResponseWriter, _ *http.Request) {
@@ -104,6 +122,14 @@ func (a *API) ready(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"status": "not_ready",
 			"error":  jaybase.AppError{Code: jaybase.ErrIntegrity, Message: "store head verification failed"},
+		})
+		return
+	}
+	contains, err := a.minimumRootPresent()
+	if err != nil || !contains {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"status": "not_ready",
+			"error":  jaybase.AppError{Code: jaybase.ErrIntegrity, Message: "configured minimum root is absent from live history"},
 		})
 		return
 	}
@@ -228,6 +254,7 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			event.Payload = payload
+			addPayloadRead(w)
 		}
 		events = append(events, event)
 	}
@@ -271,6 +298,7 @@ func (a *API) putNamedRef(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) snapshot(w http.ResponseWriter, _ *http.Request) {
+	setRequestAudit(w, "snapshot", "failed", "", 0)
 	a.snapshotMu.Lock()
 	defer a.snapshotMu.Unlock()
 	if a.backupDir == "" {
@@ -304,6 +332,7 @@ func (a *API) snapshot(w http.ResponseWriter, _ *http.Request) {
 		a.logger.Error("snapshot retention cleanup failed", "error", err,
 			"snapshot", info.Path, "root", info.Root)
 	}
+	setRequestAudit(w, "snapshot", "created", info.Root, info.Nodes)
 	writeJSON(w, http.StatusCreated, info)
 }
 
@@ -330,24 +359,31 @@ func pruneSnapshots(dir string, retain int) error {
 }
 
 func (a *API) verify(w http.ResponseWriter, _ *http.Request) {
-	nodes, err := a.store.AuditLog()
-	if err == nil {
-		for _, node := range nodes {
-			if _, payloadErr := a.store.NodePayload(node); payloadErr != nil {
-				err = payloadErr
-				break
-			}
-		}
+	setRequestAudit(w, "verify", "failed", "", 0)
+	root, nodes, err := a.store.VerifyAll()
+	if err != nil {
+		setRequestAudit(w, "verify", "failed", root, nodes)
+		writeAPIError(w, err)
+		return
 	}
+	setRequestAudit(w, "verify", "verified", root, nodes)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "verified", "root": root, "nodes": nodes})
+}
+
+func (a *API) checkRoot(w http.ResponseWriter, r *http.Request) {
+	root := strings.TrimSpace(r.URL.Query().Get("root"))
+	setRequestAudit(w, "check_root", "missing", root, 0)
+	contains, err := a.store.ContainsRoot(root)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	root := ""
-	if len(nodes) > 0 {
-		root = nodes[len(nodes)-1].Hash
+	if !contains {
+		writeError(w, http.StatusConflict, jaybase.ErrIntegrity, "expected root is absent from live history")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "verified", "root": root, "nodes": len(nodes)})
+	setRequestAudit(w, "check_root", "present", root, 0)
+	writeJSON(w, http.StatusOK, map[string]any{"status": "present", "root": root})
 }
 
 func (a *API) require(minimum Role, next http.Handler) http.Handler {
@@ -356,6 +392,10 @@ func (a *API) require(minimum Role, next http.Handler) http.Handler {
 		parts := strings.SplitN(header, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 			setRequestPrincipal(w, "unauthenticated", "")
+			if !a.failedAuthLimiter.Allow("failed-auth") {
+				writeRateLimit(w)
+				return
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="jaybase"`)
 			writeError(w, http.StatusUnauthorized, jaybase.ErrPermission, "valid bearer token required")
 			return
@@ -363,11 +403,19 @@ func (a *API) require(minimum Role, next http.Handler) http.Handler {
 		principal, ok := a.auth.Authenticate(strings.TrimSpace(parts[1]))
 		if !ok {
 			setRequestPrincipal(w, "unauthenticated", "")
+			if !a.failedAuthLimiter.Allow("failed-auth") {
+				writeRateLimit(w)
+				return
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="jaybase"`)
 			writeError(w, http.StatusUnauthorized, jaybase.ErrPermission, "valid bearer token required")
 			return
 		}
 		setRequestPrincipal(w, principal.ID, principal.Role.String())
+		if !a.requestLimiter.Allow(principal.ID) {
+			writeRateLimit(w)
+			return
+		}
 		if principal.Role < minimum {
 			writeError(w, http.StatusForbidden, jaybase.ErrPermission, "credential does not have permission for this operation")
 			return
@@ -375,6 +423,24 @@ func (a *API) require(minimum Role, next http.Handler) http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal))
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (a *API) requireMutation(minimum Role, next http.Handler) http.Handler {
+	return a.require(minimum, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contains, err := a.minimumRootPresent()
+		if err != nil || !contains {
+			writeError(w, http.StatusServiceUnavailable, jaybase.ErrIntegrity, "configured minimum root is absent from live history")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
+}
+
+func (a *API) minimumRootPresent() (bool, error) {
+	if a.minimumRoot == "" {
+		return true, nil
+	}
+	return a.store.ContainsRoot(a.minimumRoot)
 }
 
 func principalFromContext(ctx context.Context) Principal {
@@ -404,7 +470,7 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusRequestEntityTooLarge, jaybase.ErrValidation, "request body exceeds the configured size limit")
 		return
 	}
-	writeError(w, http.StatusBadRequest, jaybase.ErrValidation, err.Error())
+	writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "request body must contain exactly one valid JSON object")
 }
 
 func hasJSONContentType(r *http.Request) bool {
@@ -448,9 +514,14 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 type responseRecorder struct {
 	http.ResponseWriter
-	status      int
-	principalID string
-	role        string
+	status       int
+	principalID  string
+	role         string
+	operation    string
+	outcome      string
+	root         string
+	nodes        int
+	payloadsRead int
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
@@ -465,14 +536,44 @@ func setRequestPrincipal(w http.ResponseWriter, id, role string) {
 	}
 }
 
+func setRequestAudit(w http.ResponseWriter, operation, outcome, root string, nodes int) {
+	if recorder, ok := w.(*responseRecorder); ok {
+		recorder.operation = operation
+		recorder.outcome = outcome
+		recorder.root = root
+		recorder.nodes = nodes
+	}
+}
+
+func addPayloadRead(w http.ResponseWriter) {
+	if recorder, ok := w.(*responseRecorder); ok {
+		recorder.payloadsRead++
+	}
+}
+
 func (a *API) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		recorder := &responseRecorder{ResponseWriter: w, status: http.StatusOK, principalID: "anonymous"}
 		next.ServeHTTP(recorder, r)
-		a.logger.Info("request", "method", r.Method, "path", r.URL.Path,
+		attributes := []any{"method", r.Method, "path", r.URL.Path,
 			"status", recorder.status, "duration_ms", time.Since(started).Milliseconds(),
-			"principal_id", recorder.principalID, "role", recorder.role)
+			"principal_id", recorder.principalID, "role", recorder.role}
+		if r.URL.Path == "/v1/events" && r.Method == http.MethodGet {
+			limit := 100
+			if raw := r.URL.Query().Get("limit"); raw != "" {
+				limit, _ = strconv.Atoi(raw)
+			}
+			attributes = append(attributes,
+				"include_payload", r.URL.Query().Get("include_payload") == "true",
+				"payloads_decrypted", recorder.payloadsRead,
+				"limit", limit, "after_present", r.URL.Query().Has("after"))
+		}
+		if recorder.operation != "" {
+			attributes = append(attributes, "operation", recorder.operation, "outcome", recorder.outcome,
+				"root", recorder.root, "nodes", recorder.nodes)
+		}
+		a.logger.Info("request", attributes...)
 	})
 }
 

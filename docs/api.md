@@ -16,6 +16,10 @@ verifies that the current root addresses a valid, complete head node in constant
 time. Neither route exposes data or requires authentication; the admin verify
 route performs the full history and decryption check. A failed readiness check
 returns `503` with `status: "not_ready"` and an `integrity_error`.
+When `JAYBASE_MINIMUM_ROOT` is set, readiness also requires that independently
+pinned root to remain in live history. Event appends and named-ref updates enforce
+the same pin inside the authenticated handler and return `503 integrity_error`
+when it is absent; protection does not depend only on external health routing.
 
 ## Root
 
@@ -108,6 +112,14 @@ valid node. If the current ref differs from `expected_root`, the update returns
   the configured free-space reserve and prunes the oldest managed snapshots
   after a successful write. If post-write retention cleanup fails, the durable
   archive still returns `201`; the server logs the cleanup failure for operators.
+- `GET /v1/admin/check-root?root=sha256:...` requires `admin`. It returns `200`
+  when the supplied off-host pin is the live root or an ancestor and
+  `409 integrity_error` when it is absent.
+
+Authenticated calls are limited per principal; failed authentication is limited
+globally. Configure `JAYBASE_RATE_LIMIT_PER_MINUTE` and
+`JAYBASE_FAILED_AUTH_LIMIT_PER_MINUTE`. A limited call returns `429`, error code
+`rate_limited`, and `Retry-After: 60`.
 
 Request bodies are limited to 1 MiB at the application and 2 MiB at the proxy;
 an application-limit violation returns one structured `413 validation_error`.

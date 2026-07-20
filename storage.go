@@ -29,6 +29,7 @@ const (
 	ErrConflict   ErrorCode = "conflict"
 	ErrIntegrity  ErrorCode = "integrity_error"
 	ErrCapacity   ErrorCode = "capacity_exceeded"
+	ErrRateLimit  ErrorCode = "rate_limited"
 )
 
 type AppError struct {
@@ -127,6 +128,9 @@ func Open(dir string) (*Store, error) {
 	return OpenStore(dir)
 }
 
+// OpenStore is for local development and compatibility. It creates or reads a
+// data key inside the store directory. Production and hosted processes must use
+// OpenStoreWithDataKey so snapshots and storage do not share a key location.
 func OpenStore(dir string) (*Store, error) {
 	return openStore(dir, "", false)
 }
@@ -275,6 +279,55 @@ func (s *Store) VerifyHead() error {
 	}
 	_, err = s.readNode(root)
 	return err
+}
+
+// ContainsRoot reports whether root is an ancestor of, or equal to, the
+// current root. It lets an operator prove that a previously pinned tip remains
+// in the live linear history and therefore detect a volume-level rollback.
+func (s *Store) ContainsRoot(root string) (bool, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return false, appErr(ErrValidation, "root is required")
+	}
+	if err := validateHash(root); err != nil {
+		return false, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	current, err := s.currentRoot()
+	if err != nil {
+		return false, err
+	}
+	if current != s.indexedRoot() {
+		return false, appErr(ErrIntegrity, "current root does not match the in-memory history index")
+	}
+	_, ok := s.historyIndex[root]
+	return ok, nil
+}
+
+// VerifyAll verifies every node and authenticates every encrypted payload
+// without materializing a second in-memory copy of the history.
+func (s *Store) VerifyAll() (root string, nodes int, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	root, err = s.currentRoot()
+	if err != nil {
+		return "", 0, err
+	}
+	if root != s.indexedRoot() {
+		return "", 0, appErr(ErrIntegrity, "current root does not match the in-memory history index")
+	}
+	for _, hash := range s.history {
+		node, readErr := s.readNode(hash)
+		if readErr != nil {
+			return root, nodes, readErr
+		}
+		if _, payloadErr := s.nodePayload(node); payloadErr != nil {
+			return root, nodes, payloadErr
+		}
+		nodes++
+	}
+	return root, nodes, nil
 }
 
 func (s *Store) indexedRoot() string {
@@ -551,6 +604,12 @@ func (s *Store) EventPage(after string, limit int) (EventPage, error) {
 }
 
 func (s *Store) NodePayload(node Node) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.nodePayload(node)
+}
+
+func (s *Store) nodePayload(node Node) ([]byte, error) {
 	if node.SealedPayload != nil {
 		return decryptPayload(s.key, node.SealedPayload)
 	}

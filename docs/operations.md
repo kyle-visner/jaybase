@@ -16,6 +16,13 @@
 Compose publishes only Caddy. Jaybase port 8080 stays on the private Compose
 network.
 
+The reference Compose file enforces per-credential API and global failed
+authentication limits. Defaults are 600 and 30 per minute; tune
+`JAYBASE_RATE_LIMIT_PER_MINUTE` and `JAYBASE_FAILED_AUTH_LIMIT_PER_MINUTE` after
+measuring normal agents. A limited call returns `429` with `Retry-After: 60`.
+Use Caddy logs and the provider firewall/WAF for network allowlists, volumetric
+controls, and alerts on bursts of `401` or any `429`.
+
 ## Routine backup
 
 Call the snapshot endpoint with an admin token:
@@ -47,6 +54,22 @@ Keep these items in separate failure domains:
 - `secrets/data_key`;
 - an operator record containing the snapshot root and timestamp.
 
+After export, prove that the recorded root is still in live history:
+
+```sh
+curl -fsS -G \
+  -H "Authorization: Bearer $JAYBASE_ADMIN_TOKEN" \
+  --data-urlencode "root=$OFF_HOST_ROOT" \
+  "$JAYBASE_URL/v1/admin/check-root"
+```
+
+Set `JAYBASE_MINIMUM_ROOT` to the last off-host pin and recreate Jaybase when
+readiness should enforce the same condition. Advance it only after exporting and
+verifying the corresponding snapshot. When the pin is absent, Jaybase rejects
+event appends and named-ref updates with `503 integrity_error` even if traffic can
+still reach the process; reads and admin verification remain available for
+forensic investigation.
+
 Use a scheduler on the host or in an external automation system to trigger and
 export snapshots. Do not place the admin token directly in a crontab; read it
 from a root-owned credential file or secret manager.
@@ -65,7 +88,71 @@ curl -fsS -X POST \
 ```
 
 Run this periodically and before declaring a backup good. It checks the hash
-chain and authenticates every encrypted payload.
+chain and authenticates every encrypted payload. Verification processes one
+node at a time instead of materializing another history copy, but remains an
+O(history) admin operation. Schedule it and monitor its logged duration.
+
+## Credential rotation
+
+Add an expiring replacement, recreate Jaybase, move the client, revoke the old
+credential, and recreate again:
+
+```sh
+go run ./cmd/jaybase-server add-token \
+  ./secrets/auth.json writer-next writer "$NOT_AFTER_RFC3339"
+docker compose up -d --force-recreate jaybase
+go run ./cmd/jaybase-server revoke-token ./secrets/auth.json writer-old
+docker compose up -d --force-recreate jaybase
+```
+
+Set `NOT_AFTER_RFC3339` to a reviewed near-term UTC boundary. `add-token` prints
+plaintext once; send it only to a password manager or trusted secret-import
+command. Expiry is enforced without reload, while file changes
+need recreation. If a token enters a ticket, log, chat, prompt, or shell history,
+use this procedure immediately and audit that principal's earlier requests.
+
+## Data-key migration after compromise
+
+Migration is offline and writes a new store; it never edits the source. New
+ciphertext means every node hash changes, including roots held by named refs.
+
+1. Isolate the incident, export logs, stop Jaybase, and snapshot the source for
+   forensics. Ensure no process can append.
+2. Generate a new 32-byte key in a trusted secret manager. Materialize old and
+   new keys temporarily as mode-0600 files outside both data directories.
+3. Migrate into a previously nonexistent destination:
+
+   ```sh
+   umask 077
+   go run ./cmd/jaybase-server migrate-key \
+     /srv/jaybase-old /srv/jaybase-new /run/keys/old /run/keys/new \
+     > /secure/jaybase-key-migration.json
+   ```
+
+4. Preserve that mode-0600 JSON result off-host. It records source and destination
+   roots, counts, and the complete `hash_map`. Start the destination with the new
+   external key, run admin verify, compare counts and representative facts, and
+   export a new snapshot.
+5. Named refs are translated automatically. Translate external replay checkpoints
+   through `hash_map` or force a cold replay. Payload bytes are deliberately not
+   rewritten, so domain fields such as `supersedes` still contain source hashes;
+   consumers must retain the map when resolving them or append explicit mapping
+   facts after cutover. Resolve all ambiguous pre-cutover writes and never retry
+   an old idempotency key against the migrated store.
+6. Set the minimum-root pin to the destination root, then cut over traffic.
+   Retain the source read-only under incident policy and remove temporary key
+   files using the secret-manager procedure.
+
+If migration fails before all nodes and named refs are durable, Jaybase closes
+and removes the destination it created; a cleanup failure is joined into the
+reported error with the exact remaining path. If only the final store close
+fails, Jaybase preserves the completed destination and emits its JSON migration
+manifest before the CLI exits nonzero. Inspect and verify that destination rather
+than deleting it automatically. Retry into a nonexistent directory only after
+confirming that the earlier path is absent or intentionally retained.
+Re-encryption limits future exposure; it cannot undo access to the compromised
+old key. A KMS/HSM should unwrap into the existing read-only key-file mount,
+never onto the data volume.
 
 ## Restore drill
 
@@ -113,10 +200,10 @@ changes before updating across schema versions.
 
 ## Incident priorities
 
-If a token is exposed, revoke its digest and recreate the service immediately.
+If a token is exposed, use the add/recreate/revoke/recreate procedure immediately.
 If the data key may be exposed, isolate the host, preserve logs and volumes, and
-treat every payload as compromised. This version cannot rotate the data key in
-place; migrate validated facts to a freshly keyed store after the incident.
+treat every payload as compromised. Use the offline migration above; there is no
+in-place or zero-downtime key rotation.
 
 If integrity verification fails, stop writes, preserve the current volume, and
 compare its root and node set with off-host snapshots. Do not repair files in
