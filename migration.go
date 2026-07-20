@@ -22,8 +22,17 @@ type KeyMigrationInfo struct {
 // MigrateDataKey decrypts the complete source history and writes an equivalent
 // history to a new, previously nonexistent directory using newEncodedKey. The
 // source is held read-only for the duration. Callers must keep the service
-// offline so the returned destination is a complete cutover point.
+// offline so the returned destination is a complete cutover point. If only the
+// final destination close fails, the completed destination is preserved and the
+// populated result is returned alongside the error for operator verification.
 func (s *Store) MigrateDataKey(destinationDir, newEncodedKey string) (result KeyMigrationInfo, returnErr error) {
+	return s.migrateDataKey(destinationDir, newEncodedKey, OpenStoreWithDataKey)
+}
+
+func (s *Store) migrateDataKey(
+	destinationDir, newEncodedKey string,
+	openDestination func(string, string) (*Store, error),
+) (result KeyMigrationInfo, returnErr error) {
 	sourceAbs, err := filepath.Abs(s.dir)
 	if err != nil {
 		return KeyMigrationInfo{}, err
@@ -76,7 +85,7 @@ func (s *Store) MigrateDataKey(destinationDir, newEncodedKey string) (result Key
 		}
 	}()
 
-	destination, err = OpenStoreWithDataKey(destinationAbs, newEncodedKey)
+	destination, err = openDestination(destinationAbs, newEncodedKey)
 	if err != nil {
 		return KeyMigrationInfo{}, fmt.Errorf("open destination store: %w", err)
 	}
@@ -132,11 +141,11 @@ func (s *Store) MigrateDataKey(destinationDir, newEncodedKey string) (result Key
 		SourceRoot: sourceRoot, DestinationRoot: newRoot,
 		Nodes: len(s.history), NamedRefs: namedRefs, HashMap: rootMap,
 	}
+	cleanupDestination = false
 	if err := destination.Close(); err != nil {
 		destinationOpen = false
-		return KeyMigrationInfo{}, fmt.Errorf("close destination store: %w", err)
+		return result, fmt.Errorf("close completed destination store %s: %w", destinationAbs, err)
 	}
 	destinationOpen = false
-	cleanupDestination = false
 	return result, nil
 }

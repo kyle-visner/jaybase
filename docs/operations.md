@@ -143,12 +143,16 @@ ciphertext means every node hash changes, including roots held by named refs.
    Retain the source read-only under incident policy and remove temporary key
    files using the secret-manager procedure.
 
-If migration fails, retain the error. Jaybase closes and removes the destination
-it created before returning; a cleanup failure is joined into the reported error
-with the exact remaining path. Retry into a nonexistent directory only after
-confirming that path is absent. Re-encryption limits future exposure; it cannot
-undo access to the compromised old key. A KMS/HSM should unwrap into the existing
-read-only key-file mount, never onto the data volume.
+If migration fails before all nodes and named refs are durable, Jaybase closes
+and removes the destination it created; a cleanup failure is joined into the
+reported error with the exact remaining path. If only the final store close
+fails, Jaybase preserves the completed destination and emits its JSON migration
+manifest before the CLI exits nonzero. Inspect and verify that destination rather
+than deleting it automatically. Retry into a nonexistent directory only after
+confirming that the earlier path is absent or intentionally retained.
+Re-encryption limits future exposure; it cannot undo access to the compromised
+old key. A KMS/HSM should unwrap into the existing read-only key-file mount,
+never onto the data volume.
 
 ## Restore drill
 

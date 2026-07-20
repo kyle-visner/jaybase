@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -249,10 +250,12 @@ func migrateKey() error {
 	}
 	defer store.Close()
 	result, err := store.MigrateDataKey(os.Args[3], strings.TrimSpace(string(newKey)))
-	if err != nil {
-		return err
+	if err == nil || result.HashMap != nil {
+		if encodeErr := json.NewEncoder(os.Stdout).Encode(result); encodeErr != nil {
+			return errors.Join(err, encodeErr)
+		}
 	}
-	return json.NewEncoder(os.Stdout).Encode(result)
+	return err
 }
 
 func initSecrets() error {

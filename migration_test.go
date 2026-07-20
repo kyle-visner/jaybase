@@ -145,6 +145,50 @@ func TestMigrateDataKeyRemovesIncompleteDestinationOnFailure(t *testing.T) {
 	}
 }
 
+func TestMigrateDataKeyPreservesCompletedDestinationOnCloseFailure(t *testing.T) {
+	source, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if _, err := source.Append(Context{Actor: "writer"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]bool{"complete": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(t.TempDir(), "completed")
+	newKey := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("n", 32)))
+	result, err := source.migrateDataKey(destination, newKey, func(dir, key string) (*Store, error) {
+		store, openErr := OpenStoreWithDataKey(dir, key)
+		if openErr != nil {
+			return nil, openErr
+		}
+		if closeErr := store.lock.file.Close(); closeErr != nil {
+			t.Fatalf("force destination close failure: %v", closeErr)
+		}
+		return store, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "close completed destination store") {
+		t.Fatalf("completed close error = %v", err)
+	}
+	if result.DestinationRoot == "" || len(result.HashMap) != 1 {
+		t.Fatalf("completed migration result was lost: %#v", result)
+	}
+	if _, err := os.Stat(destination); err != nil {
+		t.Fatalf("completed destination was removed: %v", err)
+	}
+
+	reopened, err := OpenStoreWithDataKey(destination, newKey)
+	if err != nil {
+		t.Fatalf("reopen completed destination: %v", err)
+	}
+	defer reopened.Close()
+	root, nodes, err := reopened.VerifyAll()
+	if err != nil || root != result.DestinationRoot || nodes != 1 {
+		t.Fatalf("preserved destination verification: root=%q nodes=%d err=%v", root, nodes, err)
+	}
+}
+
 func corruptNode(t *testing.T, store *Store, hash string) {
 	t.Helper()
 	path := store.NodePath(hash)
