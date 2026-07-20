@@ -68,10 +68,10 @@ operation. An empty string is the expected root of a new database.
 curl -fsS -X POST "$JAYBASE_URL/v1/events" \
   -H "Authorization: Bearer $JAYBASE_TOKEN" \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: fact-customer-42-primary-contact-v1" \
+  -H "Idempotency-Key: fact-primary-contact-v1-7f3d2a" \
   --data '{
     "type": "business.fact",
-    "entity_id": "customer:42",
+    "entity_id": "01JOPAQUE8F3K2M7Q9R4T6V1WX",
     "command": "fact assert",
     "payload": {"primary_contact": "Ada Lovelace"},
     "expected_root": ""
@@ -99,8 +99,15 @@ root, err := store.Append(jaybase.Context{Actor: "agent"}, jaybase.AppendOptions
 
 `OpenStore` retains the original local key fallback for compatibility and takes
 an advisory single-writer lock at `.jaybase/.writer.lock` until `Close`.
-Long-running hosted processes should use `OpenStoreWithDataKey`; the bundled
-server enforces that choice.
+It is a local-development convenience and co-locates the key with the data.
+Production and all long-running hosted processes must use `OpenStoreWithDataKey`;
+the bundled server enforces that choice.
+
+Hosted mode also supports expiring credentials, add/revoke helpers, off-host root
+pin checks, per-principal throttling, payload-read audit fields, streaming full
+verification, and offline data-key migration. Follow the financial profile in
+[security](docs/security.md) and the procedures in [operations](docs/operations.md)
+before storing sensitive data.
 
 ## Verify
 

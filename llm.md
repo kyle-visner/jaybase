@@ -27,6 +27,10 @@ Never put a token in a URL, payload, log, source file, prompt transcript, or
 idempotency key. Send it only in the `Authorization` header. Use the lowest role
 that can complete the task.
 
+Tokens can expire at their `not_after` boundary. Treat `401` as a credential
+incident or rotation event; never paste the rejected token into a prompt, ticket,
+or log while diagnosing it.
+
 All `/v1` requests use:
 
 ```http
@@ -240,6 +244,9 @@ copy it off-host and retain the data key in a separate failure domain.
 
 - Use HTTPS except for an explicitly local test.
 - Treat the bearer token and decrypted payloads as sensitive.
+- Put PII, account numbers, tax identifiers, and human-readable financial detail
+  in encrypted payloads only. Metadata (`type`, `entity_id`, actor, role,
+  command, timestamp, and parents) is plaintext; use opaque identifiers there.
 - Read before making a decision; fetch a root immediately before writing.
 - Reuse the same idempotency key and body for an ambiguous retry.
 - Reconcile rather than overwrite when the root changes.
