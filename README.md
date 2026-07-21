@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/jaybase-logo.png" alt="Jaybase logo" width="900">
+</p>
+
 # Jaybase
 
 Jaybase is a hostable, AI-native information base for replayable,
