@@ -4,33 +4,53 @@
 
 # Jaybase
 
-**A durable, verifiable fact store for AI agents that need to show their work.**
+**A safer data layer for AI agents doing real business work.**
 
-AI agents can do useful work, but they are not always careful record keepers.
-They retry requests, act on stale information, hand work to other agents, and
-occasionally change their minds. Once an agent is allowed to touch important
-business data, “what does the database say now?” is no longer enough. You also
-need to know what happened, who did it, and what the agent knew at the time.
+AI agents become genuinely useful when we can trust them with more than advice.
+They need to read and write the same financial, operational, customer, and
+compliance data that people use to run a business. If every change still needs a
+human to copy, approve, and enter it, the agent is a helper—not an operator.
 
-Jaybase gives agents a shared history they cannot accidentally overwrite. Every
-change is recorded as a new fact with an identity, a timestamp, and the command
-that produced it. The history can be replayed, checked for unexpected changes,
-and used to rebuild whatever view of the data you need today.
+That level of trust is hard to grant. Traditional databases were designed as
+backends for deterministic software: the code follows known paths, the schema is
+controlled, and writes are expected to be intentional. Agents behave more like
+people. They interpret context, make judgment calls, retry when outcomes are
+unclear, and sometimes do surprising or incorrect things. Unlike people, they
+can do all of that at machine speed.
 
-Jaybase preserves what was asserted. It does not decide whether an assertion is
-true or apply your business rules for you.
+Giving an agent direct access to a mutable database means one bad decision,
+runaway loop, prompt injection, or compromised credential can overwrite or
+delete critical data before anyone notices. Audit logs, request deduplication,
+history, and rollback can be added to a traditional system, but they are not
+usually inseparable from every write.
+
+Jaybase exists to make high-trust delegation practical. Agents can read shared
+business history and add new facts, but they cannot silently rewrite the past.
+Every write is attributable, logged, retry-safe, checked against the state on
+which the decision was based, and preserved for replay. When an agent is wrong,
+the correction becomes part of the record instead of erasing the mistake.
+
+The facts themselves stay flexible. An agent can introduce new JSON fields and
+new fact types as its job evolves without migrating or rewriting old history.
+The safety rules around those facts stay fixed.
+
+Jaybase does not make an agent infallible or decide whether a fact is true. An
+authorized agent can still assert a bad fact. Jaybase makes that action bounded,
+visible, and correctable instead of silently destructive.
 
 ## Who Jaybase is for
 
-Jaybase is for developers and small teams building agents that take real action
-on important data. It is a good fit when:
+Jaybase is for developers and small teams moving from read-only copilots to
+agents that are allowed to operate. It is a good fit when:
 
-- an agent's work must survive a restart, a handoff, or a model change;
-- you need a clear record of which agent or operator made each change;
-- a timed-out request may be retried and must not create duplicate work;
-- an agent acting on old information must not silently overwrite newer facts;
-- corrections need to preserve the original claim and explain what changed; or
-- sensitive business facts need to stay encrypted and under your control.
+- agents need to read and write critical business data without getting direct
+  power to update or delete history;
+- a mistake, retry loop, or malicious instruction must not be able to erase the
+  source of truth;
+- every action must be tied to an agent or operator and explainable later;
+- bad decisions need to be reversible without pretending they never happened;
+- the shape of the facts will evolve as the agent learns new jobs; or
+- sensitive data needs to stay encrypted and under your control.
 
 That makes Jaybase especially useful for accounting, operations, compliance,
 approvals, and other workflows where the history matters as much as the latest
@@ -44,34 +64,36 @@ systems.
 
 ## Why Jaybase exists
 
-Traditional databases are very good at storing the current state of an
-application. That is exactly what most applications need. But agent workflows
-add a few awkward questions:
+Traditional databases are not bad databases. They are optimized for applications
+whose deterministic code owns the rules around each read and write. Agents
+change that assumption. The data layer now has to defend the business from a
+caller that is useful precisely because it can make its own decisions.
 
-- Did the first write succeed before the agent timed out and tried again?
-- Did another agent change the data after this decision was made?
-- Was a fact corrected, or was the old value simply replaced?
-- Can we reconstruct the inputs behind a decision months later?
-- Can we tell if stored history changed after the fact?
-
-You can answer those questions with SQL tables, audit triggers, application
-logs, request IDs, and careful locking. The problem is that every application
-has to design and enforce those rules correctly. Jaybase makes them the default
-write path instead of optional conventions.
-
-| When this happens | In a typical application database | In Jaybase |
+| Agent systems need | A typical database requires you to add | Jaybase makes native |
 | --- | --- | --- |
-| An agent retries after a timeout | The application must detect and remove duplicates. | The same request returns the result of the first successful write. |
-| Two agents act on the same old state | The last write may win unless the application adds locking. | The stale write is rejected so the agent can reconsider it. |
-| A fact is corrected | An update can erase the value that came before. | The correction is appended and the original fact remains in history. |
-| Someone asks for an audit trail | Logs and database rows must be pieced together. | The ordered history can be replayed and checked from a known root. |
-| A product needs fast queries and reports | SQL is excellent at this. | Replay Jaybase into a SQL projection built for those queries. |
+| A safe response to unexpected behavior or intentional misuse | Permissions and application code around every mutation and delete path | An append-only API, credential roles, server-owned identity, and request throttling |
+| Reversible outcomes | Audit tables, backups, and custom rollback logic | Append-only facts and replay, so corrections and retractions do not delete history |
+| Auditable decisions | A separate logging system kept in sync with database writes | The actor, time, command, and place in history on every event |
+| Safe retries at machine speed | Application-specific request deduplication | A stable request key that returns the original successful result |
+| Protection from stale decisions | Locking or version checks added by each application | A rejected write when the history changed after the agent read it |
+| A model that evolves with the agent | Schema migrations or a custom document contract | Flexible JSON facts and new event types without rewriting old data |
+| Fast current-state queries | This is what SQL already does well | A rebuildable SQLite or PostgreSQL projection alongside Jaybase |
+
+All of these protections can be built around PostgreSQL or another general
+database. Jaybase's point is that an agent should not depend on every application
+team remembering to build them. They are part of the storage contract for every
+write.
 
 ## How it works
 
-Jaybase stores an ordered chain of events. Each event contains a type, an entity
-ID, the command that produced it, the authenticated actor, a timestamp, and an
-encrypted JSON payload. Each event also points to the event before it.
+Jaybase separates flexible facts from a rigid safety boundary. The payload can
+be any JSON your application understands, while the write protocol and history
+rules do not change.
+
+Under that boundary, Jaybase stores an ordered chain of events. Each event
+contains a type, an entity ID, the command that produced it, the authenticated
+actor, a timestamp, and an encrypted JSON payload. Each event also points to the
+event before it.
 
 The normal write flow is:
 
@@ -93,6 +115,17 @@ Consumers read events in order and apply their own domain rules. A correction,
 retraction, or approval is another event rather than an edit to old data. This
 keeps the stored history simple while letting each application decide what the
 facts mean.
+
+That is what reversibility means in Jaybase: do not erase the bad action. Append
+the correction, replay the history, and rebuild the current state. You can return
+the business to the right outcome without losing the evidence of how it got
+there.
+
+The hosted API has no path for an agent to edit or delete earlier events. It also
+does not let callers choose their own identity; the server derives the actor and
+role from the credential. Least-privilege roles and per-principal throttling add
+boundaries around unexpected behavior, runaway automation, and intentional
+misuse.
 
 Jaybase intentionally has one writer process per data volume. Many agents can
 use the service, but writes are serialized through that process. This is a small,
