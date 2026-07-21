@@ -1,34 +1,88 @@
+<p align="center">
+  <img src="docs/assets/jaybase-logo.png" alt="Jaybase logo" width="900">
+</p>
+
 # Jaybase
 
-Jaybase is a hostable, AI-native information base for replayable,
-tamper-evident business facts. It stores an append-only chain of encrypted JSON
-events and exposes that chain through a small authenticated HTTP API.
+## TL;DR
 
-The Go module remains usable as an embedded local library. Hosted mode adds the
-network, identity, concurrency, backup, and operational boundaries needed for a
-shared source of truth.
+Jaybase is an append-only fact store for AI agents trusted with critical
+business data. Agents can add flexible JSON facts, but the hosted API cannot
+rewrite or delete history. Every write is attributed, encrypted, safe to retry,
+checked for stale state, and available for replay.
 
-## Hosted model
+Requires Go 1.22 or later:
 
-- A single Jaybase process owns the writable data volume.
-- Caddy terminates HTTPS and obtains certificates automatically.
-- Bearer credentials map to `reader`, `writer`, or `admin`; plaintext tokens are
-  never stored by Jaybase.
-- Every hosted append includes an expected root and idempotency key, making
-  concurrent updates explicit and retries safe.
-- Payloads use AES-256-GCM at rest. The data key is mounted separately from the
-  volume and excluded from snapshots.
-- Snapshots are consistent archives of encrypted nodes and refs, suitable for
-  off-host replication.
-- Containers run as non-root with a read-only root filesystem and dropped Linux
-  capabilities.
+```sh
+git clone https://github.com/kyle-visner/jaybase.git
+cd jaybase
+go install ./cmd/jaybase-server
+jaybase-server init ./secrets
+```
 
-See [architecture](docs/architecture.md), [security](docs/security.md),
-[API](docs/api.md), and [operations](docs/operations.md) for the full contract.
-Agents integrating with Jaybase should use [llm.md](llm.md) as their operating
-contract.
+The initializer prints reader, writer, and admin tokens once. Save them in a
+password manager, then continue to [Run Jaybase](#run-jaybase).
 
-## Deploy in five steps
+## Who Jaybase is for
+
+Jaybase is for developers and small teams moving from read-only copilots to
+agents that are allowed to operate. It fits accounting, operations, compliance,
+approvals, and other work where agents write critical data, mistakes must stay
+visible and correctable, and fact shapes evolve with the job.
+
+Jaybase is designed for single-tenant systems: one organization, one trust
+boundary, and one writer process per store. Many agents and applications can
+share that store, including dashboards, internal tools, APIs, and automated
+workflows. Jaybase is not meant to be the globally distributed, multi-tenant
+backend for a web application.
+
+## Why Jaybase exists
+
+Traditional databases assume deterministic application code owns every read and
+write. Agents make judgment calls, retry uncertain work, and sometimes behave in
+unexpected ways—at machine speed. A mutable database can turn one bad decision,
+runaway loop, or malicious instruction into lost source data before anyone
+notices.
+
+| Agent risk | Jaybase response |
+| --- | --- |
+| Destructive behavior or a wrong decision | Append-only writes, credential roles, throttling, and corrections that preserve evidence |
+| A timeout or stale decision | Return the original retry result or reject a write based on old history |
+| A changing job | Accept new JSON fields and fact types without rewriting old facts |
+
+You can build these protections around a general-purpose database. Jaybase makes
+them part of every write instead of leaving them to each application.
+
+Jaybase does not decide whether a fact is true. An authorized agent can still
+write a bad fact; Jaybase keeps that action visible and correctable.
+
+## How it works
+
+Jaybase stores a linear chain of events. Each event records what happened, who
+did it, an encrypted JSON payload, and the event before it. Payloads stay
+flexible; the history rules do not.
+
+The normal write flow is:
+
+1. Read the current `root`.
+2. Submit a fact with that `expected_root` and a stable `Idempotency-Key`.
+3. Jaybase derives the actor, encrypts and hashes the event, writes it, and
+   advances the root.
+4. Identical retries return the original event. Stale roots and reused keys with
+   different content return `409 conflict`.
+
+Each event address depends on the event before it. Changing old content changes
+the hashes that follow, so an off-host copy of the root can detect rewritten or
+replaced history.
+
+Corrections, retractions, and approvals are new events, never edits. The hosted
+API has no update or delete path for history, and callers cannot choose their own
+identity. One writer process serializes writes for each data volume; many agents
+can use that process, but Jaybase is not a distributed consensus system.
+
+## Run Jaybase
+
+### Deploy the hosted service
 
 Prerequisites: a Linux host with Docker Compose, ports 80 and 443 reachable, and
 an A/AAAA record pointing a domain at the host.
@@ -37,18 +91,17 @@ an A/AAAA record pointing a domain at the host.
 cp .env.example .env
 # Edit .env and set JAYBASE_DOMAIN.
 
-go run ./cmd/jaybase-server init ./secrets
-# Save the three printed tokens in a password manager. They are shown once.
+jaybase-server init ./secrets
 
 docker compose up -d --build
 docker compose ps
 curl https://jaybase.example.com/health/ready
 ```
 
-The initializer refuses to replace existing secrets. The server also refuses to
-start without an external data-key file and a valid hashed credential file.
+The initializer will not replace existing secrets. The server requires an
+external data key and hashed credential file.
 
-## Append and read a fact
+### Append a fact
 
 Fetch the current root first:
 
@@ -61,8 +114,9 @@ curl -fsS \
   "$JAYBASE_URL/v1/root"
 ```
 
-Use that root as `expected_root` and a new stable idempotency key for the logical
-operation. An empty string is the expected root of a new database.
+Use the returned root as `expected_root` and choose one stable idempotency key
+for the logical operation. Use an empty string only for the first event in a new
+database.
 
 ```sh
 curl -fsS -X POST "$JAYBASE_URL/v1/events" \
@@ -74,19 +128,14 @@ curl -fsS -X POST "$JAYBASE_URL/v1/events" \
     "entity_id": "01JOPAQUE8F3K2M7Q9R4T6V1WX",
     "command": "fact assert",
     "payload": {"primary_contact": "Ada Lovelace"},
-    "expected_root": ""
+    "expected_root": "sha256:root-from-the-previous-response"
   }'
 ```
 
-Readers get metadata by default. Payload decryption must be explicitly requested:
+See the [API guide](docs/api.md) for reads, pagination, refs, snapshots, and
+administrative endpoints.
 
-```sh
-curl -fsS \
-  -H "Authorization: Bearer $JAYBASE_TOKEN" \
-  "$JAYBASE_URL/v1/events?include_payload=true&limit=100"
-```
-
-## Embedded library
+### Use the embedded Go library
 
 ```go
 store, err := jaybase.OpenStore(".jaybase")
@@ -97,17 +146,23 @@ root, err := store.Append(jaybase.Context{Actor: "agent"}, jaybase.AppendOptions
 })
 ```
 
-`OpenStore` retains the original local key fallback for compatibility and takes
-an advisory single-writer lock at `.jaybase/.writer.lock` until `Close`.
-It is a local-development convenience and co-locates the key with the data.
-Production and all long-running hosted processes must use `OpenStoreWithDataKey`;
-the bundled server enforces that choice.
+`OpenStore` is a local-development convenience that co-locates the key and data.
+Production processes must use `OpenStoreWithDataKey`; the server enforces this.
 
-Hosted mode also supports expiring credentials, add/revoke helpers, off-host root
-pin checks, per-principal throttling, payload-read audit fields, streaming full
-verification, and offline data-key migration. Follow the financial profile in
-[security](docs/security.md) and the procedures in [operations](docs/operations.md)
-before storing sensitive data.
+## Production boundaries
+
+- One process owns each writable data volume.
+- Caddy handles HTTPS; bearer credentials provide `reader`, `writer`, or `admin`
+  access.
+- Payloads are encrypted at rest, with the data key stored outside the volume
+  and snapshots.
+- Snapshots should be copied off-host.
+- Containers run as non-root with a read-only root filesystem.
+
+Read the [architecture](docs/architecture.md), [security](docs/security.md),
+[API](docs/api.md), and [operations](docs/operations.md) guides before running
+Jaybase with sensitive data. Agents integrating with Jaybase should use
+[llm.md](llm.md) as their operating contract.
 
 ## Verify
 
