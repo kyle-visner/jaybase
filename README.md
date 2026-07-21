@@ -56,11 +56,9 @@ That makes Jaybase especially useful for accounting, operations, compliance,
 approvals, and other workflows where the history matters as much as the latest
 answer.
 
-Jaybase is not trying to replace every database. If you mainly need joins,
-dashboards, full-text search, low-latency current state, or many concurrent
-writers across regions, use a conventional database or a mature distributed
-event platform. Jaybase works best as the trusted fact history underneath those
-systems.
+Jaybase is focused on protecting and preserving an agent-written fact history.
+It is not designed for dashboards, full-text search, low-latency current-state
+queries, or many concurrent writers across regions.
 
 ## Why Jaybase exists
 
@@ -77,12 +75,10 @@ caller that is useful precisely because it can make its own decisions.
 | Safe retries at machine speed | Application-specific request deduplication | A stable request key that returns the original successful result |
 | Protection from stale decisions | Locking or version checks added by each application | A rejected write when the history changed after the agent read it |
 | A model that evolves with the agent | Schema migrations or a custom document contract | Flexible JSON facts and new event types without rewriting old data |
-| Fast current-state queries | This is what SQL already does well | A rebuildable SQLite or PostgreSQL projection alongside Jaybase |
 
-All of these protections can be built around PostgreSQL or another general
-database. Jaybase's point is that an agent should not depend on every application
-team remembering to build them. They are part of the storage contract for every
-write.
+All of these protections can be built around a general-purpose database.
+Jaybase's point is that an agent should not depend on every application team
+remembering to build them. They are part of the storage contract for every write.
 
 ## How it works
 
@@ -130,26 +126,6 @@ misuse.
 Jaybase intentionally has one writer process per data volume. Many agents can
 use the service, but writes are serialized through that process. This is a small,
 understandable consistency model—not a distributed consensus system.
-
-## Where SQL fits
-
-Jaybase and SQL solve different parts of the problem, and they work well
-together:
-
-```text
-agents and services
-        |
-        v
-Jaybase: trusted fact history
-        |
-        | replay
-        v
-SQLite or PostgreSQL: current state, joins, search, reports, and APIs
-```
-
-Treat Jaybase as the source of truth for what happened. Build a SQLite or
-PostgreSQL projection for the way your product needs to read the data today. If
-the projection is lost or its schema changes, rebuild it by replaying Jaybase.
 
 ## Run Jaybase
 
