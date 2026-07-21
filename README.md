@@ -30,9 +30,11 @@ agents that are allowed to operate. It fits accounting, operations, compliance,
 approvals, and other work where agents write critical data, mistakes must stay
 visible and correctable, and fact shapes evolve with the job.
 
-Jaybase is focused on protecting and preserving an agent-written fact history.
-It is not designed for dashboards, full-text search, low-latency current-state
-queries, or many concurrent writers across regions.
+Jaybase is designed for single-tenant systems: one organization, one trust
+boundary, and one writer process per store. Many agents and applications can
+share that store, including dashboards, internal tools, APIs, and automated
+workflows. Jaybase is not meant to be the globally distributed, multi-tenant
+backend for a web application.
 
 ## Why Jaybase exists
 
