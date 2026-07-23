@@ -104,8 +104,9 @@ writes. Never keep the only pin on the Jaybase volume.
 - Use full-disk encryption and an edge firewall or WAF. Application throttling is
   a backstop, not volumetric denial-of-service protection.
 - Send JSON logs to a restricted destination. Jaybase never logs bodies or
-  Authorization headers. Event reads record `include_payload`, the actual
-  `payloads_decrypted` count, `limit`, and `after_present`; verify, snapshot, and
+  Authorization headers. Event reads record `include_payload`,
+  `payload_prefix_count`, the actual `payloads_decrypted` count, `limit`, and
+  `after_present`; verify, snapshot, and
   root checks record outcome, root, node count, and duration.
 - Alert on bursts of `401`, any `429`, failed admin outcomes, and unexpected
   payload-reading principals.

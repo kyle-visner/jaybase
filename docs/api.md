@@ -60,6 +60,10 @@ Query parameters:
 - `after`: return nodes strictly after this hash in the current history.
 - `include_payload=true`: decrypt and include payloads. Payloads are omitted by
   default.
+- `payload_prefix`: decrypt payloads only for event types beginning with this
+  prefix while still returning every event's metadata in chain order. Repeat
+  the parameter to select up to 16 prefixes. When `include_payload=true` is
+  also present, all payloads are returned.
 
 The response includes `events`, the current `root`, and `has_more`. The `root`
 is the live history tip captured atomically with that page. `has_more` says
@@ -87,8 +91,8 @@ Jaybase's history is a linear append-only chain, so the captured target remains
 reachable when a concurrent writer advances the live root. A cached `after`
 hash that is not in the current history returns structured `404 not_found`; the
 client must invalidate that checkpoint and perform a cold replay. This can
-happen after restoring or replacing a store. Payload omission and
-`include_payload=true` behave identically during bounded replay.
+happen after restoring or replacing a store. Payload omission and selective or
+complete payload inclusion behave identically during bounded replay.
 
 ## Named refs
 

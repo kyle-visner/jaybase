@@ -234,6 +234,18 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
+	payloadPrefixes := r.URL.Query()["payload_prefix"]
+	if len(payloadPrefixes) > 16 {
+		writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "at most 16 payload_prefix values are allowed")
+		return
+	}
+	for index, prefix := range payloadPrefixes {
+		payloadPrefixes[index] = strings.TrimSpace(prefix)
+		if payloadPrefixes[index] == "" || len(payloadPrefixes[index]) > 128 {
+			writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "payload_prefix must be between 1 and 128 characters")
+			return
+		}
+	}
 	page, err := a.store.EventPage(r.URL.Query().Get("after"), limit)
 	if err != nil {
 		writeAPIError(w, err)
@@ -247,7 +259,7 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 			Parents: node.Parents, Actor: node.Actor, Role: node.Role, Command: node.Command,
 			CreatedAt: node.CreatedAt, RequestID: node.RequestID,
 		}
-		if includePayload {
+		if includePayload || matchesPayloadPrefix(node.Type, payloadPrefixes) {
 			payload, err := a.store.NodePayload(node)
 			if err != nil {
 				writeAPIError(w, err)
@@ -261,6 +273,15 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"events": events, "root": page.Root, "has_more": page.HasMore,
 	})
+}
+
+func matchesPayloadPrefix(nodeType string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(nodeType, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *API) getNamedRef(w http.ResponseWriter, r *http.Request) {
@@ -566,6 +587,7 @@ func (a *API) accessLog(next http.Handler) http.Handler {
 			}
 			attributes = append(attributes,
 				"include_payload", r.URL.Query().Get("include_payload") == "true",
+				"payload_prefix_count", len(r.URL.Query()["payload_prefix"]),
 				"payloads_decrypted", recorder.payloadsRead,
 				"limit", limit, "after_present", r.URL.Query().Has("after"))
 		}

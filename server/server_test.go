@@ -322,6 +322,62 @@ func TestBDDIncrementalEventReplayKeepsTheFirstRootAsItsBoundary(t *testing.T) {
 	}
 }
 
+func TestBDDSelectivePayloadReplayPreservesEveryEventMetadata(t *testing.T) {
+	api := newTestAPI(t)
+	for index, eventType := range []string{"magpie.customer.v1", "aerie.commit.created.v1", "martin.deal.created.v1"} {
+		if _, err := api.store.Append(jaybase.Context{Actor: "fixture"}, jaybase.AppendOptions{
+			Type: eventType, Command: "fixture append", Payload: map[string]any{
+				"sequence": index,
+				"secret":   eventType,
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	response := api.request(t, http.MethodGet, "/v1/events?payload_prefix=aerie.", api.tokens["reader-agent"], "", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("selective event page status=%d body=%s", response.Code, response.Body.String())
+	}
+	var page struct {
+		Events []struct {
+			Type    string          `json:"type"`
+			Payload json.RawMessage `json:"payload"`
+		} `json:"events"`
+		Root string `json:"root"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 3 || page.Root == "" {
+		t.Fatalf("selective replay omitted event metadata: %#v", page)
+	}
+	for _, event := range page.Events {
+		hasPayload := len(event.Payload) > 0
+		if hasPayload != strings.HasPrefix(event.Type, "aerie.") {
+			t.Fatalf("payload selection mismatch for %q: %#v", event.Type, event.Payload)
+		}
+	}
+	if !strings.Contains(api.logs.String(), `"payload_prefix_count":1`) ||
+		!strings.Contains(api.logs.String(), `"payloads_decrypted":1`) {
+		t.Fatalf("selective replay audit fields missing: %s", api.logs.String())
+	}
+}
+
+func TestBDDSelectivePayloadReplayRejectsInvalidPrefixes(t *testing.T) {
+	api := newTestAPI(t)
+	for _, path := range []string{
+		"/v1/events?payload_prefix=",
+		"/v1/events?payload_prefix=%20",
+		"/v1/events?" + strings.Repeat("payload_prefix=a&", 17),
+	} {
+		response := api.request(t, http.MethodGet, path, api.tokens["reader-agent"], "", "")
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"validation_error"`) {
+			t.Fatalf("invalid selective replay path=%q status=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestBDDOversizedJSONReturnsOneStructured413(t *testing.T) {
 	api := newTestAPIWithOptions(t, func(options *Options) { options.MaxBodyBytes = 64 })
 	body := `{"type":"fact","command":"remember","payload":{"value":"` + strings.Repeat("x", 128) + `"},"expected_root":""}`
