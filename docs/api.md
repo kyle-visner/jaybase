@@ -61,8 +61,9 @@ Query parameters:
 - `root`: optional observed root that bounds the page. Capture it from the first
   page and send it on every later page of the same scan.
 - `include_payload=true`: decrypt and include payloads. Payloads are omitted by
-  default. Payload-inclusive compatibility pages are capped at 100 events and
-  the configured application response limit even when `limit` is larger.
+  default. Payload-inclusive compatibility pages are limited to 100 events even
+  when `limit` is larger. If the encoded response exceeds the configured
+  application response limit, Jaybase rejects it with `507 capacity_exceeded`.
 
 Each event includes `event_id` and `hash` (the same opaque content identity in
 this version), type, entity ID, parent hashes, actor/role, command, timestamp,

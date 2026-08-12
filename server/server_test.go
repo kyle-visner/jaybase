@@ -515,7 +515,9 @@ func TestPayloadInclusiveCompatibilityReadCapsBatchAndAuditsIdentities(t *testin
 	}
 	logs := api.logs.String()
 	for _, field := range []string{
-		`"operation":"payload_read"`, `"outcome":"retrieved"`, `"selected_event_count":100`, roots[0], roots[99],
+		`"operation":"payload_read"`, `"outcome":"retrieved"`,
+		fmt.Sprintf(`"selected_event_count":%d`, maxPayloadBatchEvents),
+		roots[0], roots[maxPayloadBatchEvents-1],
 	} {
 		if !strings.Contains(logs, field) {
 			t.Fatalf("compatibility payload audit field %q missing: %s", field, logs)
