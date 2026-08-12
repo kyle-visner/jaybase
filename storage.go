@@ -662,8 +662,9 @@ func (s *Store) eventPageAt(after, observedRoot string, limit int, metadataOnly 
 
 // EventPayloads retrieves and authenticates payloads in request order. Every
 // event must belong to this store and be at or before observedRoot. The caller
-// owns batch and response-size limits; this method performs one atomic
-// authorization-to-history check under the store read lock.
+// owns batch and response-size limits. Membership and boundary checks are
+// atomic under the store read lock; immutable node reads and decryption happen
+// after releasing it so readers do not delay appends.
 func (s *Store) EventPayloads(eventIDs []string, observedRoot string) ([]EventPayload, error) {
 	return s.eventPayloads(eventIDs, observedRoot, 0)
 }
@@ -678,12 +679,45 @@ func (s *Store) EventPayloadsBounded(eventIDs []string, observedRoot string, max
 }
 
 func (s *Store) eventPayloads(eventIDs []string, observedRoot string, maxBytes int64) ([]EventPayload, error) {
+	return s.eventPayloadsWithReader(eventIDs, observedRoot, maxBytes, s.readNode)
+}
+
+func (s *Store) eventPayloadsWithReader(eventIDs []string, observedRoot string, maxBytes int64, readNode func(string) (Node, error)) ([]EventPayload, error) {
 	if len(eventIDs) == 0 {
 		return nil, appErr(ErrValidation, "at least one event ID is required")
 	}
 	if err := validateHash(observedRoot); err != nil {
 		return nil, appErr(ErrValidation, "a valid observed root is required")
 	}
+	selected, err := s.selectPayloadEventIDs(eventIDs, observedRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	// Node objects are immutable after their atomic creation. The selection
+	// helper has released the store lock before disk I/O and AES-GCM work so
+	// payload reads do not delay appends.
+	result := make([]EventPayload, 0, len(selected))
+	var payloadBytes int64
+	for _, eventID := range selected {
+		node, err := readNode(eventID)
+		if err != nil {
+			return nil, err
+		}
+		payload, err := s.nodePayload(node)
+		if err != nil {
+			return nil, err
+		}
+		if maxBytes > 0 && int64(len(payload)) > maxBytes-payloadBytes {
+			return nil, appErr(ErrCapacity, "payload response exceeds the configured size limit")
+		}
+		payloadBytes += int64(len(payload))
+		result = append(result, EventPayload{EventID: eventID, Payload: payload})
+	}
+	return result, nil
+}
+
+func (s *Store) selectPayloadEventIDs(eventIDs []string, observedRoot string) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	current, err := s.currentRoot()
@@ -697,9 +731,8 @@ func (s *Store) eventPayloads(eventIDs []string, observedRoot string, maxBytes i
 	if !ok {
 		return nil, appErr(ErrConflict, "observed root is not in the current history")
 	}
-	result := make([]EventPayload, 0, len(eventIDs))
 	seen := make(map[string]struct{}, len(eventIDs))
-	var payloadBytes int64
+	selected := make([]string, 0, len(eventIDs))
 	for _, eventID := range eventIDs {
 		if err := validateHash(eventID); err != nil {
 			return nil, err
@@ -715,21 +748,9 @@ func (s *Store) eventPayloads(eventIDs []string, observedRoot string, maxBytes i
 		if position > target {
 			return nil, appErr(ErrConflict, "event ID is beyond the observed root")
 		}
-		node, err := s.readNode(eventID)
-		if err != nil {
-			return nil, err
-		}
-		payload, err := s.nodePayload(node)
-		if err != nil {
-			return nil, err
-		}
-		if maxBytes > 0 && int64(len(payload)) > maxBytes-payloadBytes {
-			return nil, appErr(ErrCapacity, "payload response exceeds the configured size limit")
-		}
-		payloadBytes += int64(len(payload))
-		result = append(result, EventPayload{EventID: eventID, Payload: payload})
+		selected = append(selected, eventID)
 	}
-	return result, nil
+	return selected, nil
 }
 
 func (s *Store) NodePayload(node Node) ([]byte, error) {

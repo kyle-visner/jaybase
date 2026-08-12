@@ -61,7 +61,8 @@ Query parameters:
 - `root`: optional observed root that bounds the page. Capture it from the first
   page and send it on every later page of the same scan.
 - `include_payload=true`: decrypt and include payloads. Payloads are omitted by
-  default.
+  default. Payload-inclusive compatibility pages are capped at 100 events and
+  the configured application response limit even when `limit` is larger.
 
 Each event includes `event_id` and `hash` (the same opaque content identity in
 this version), type, entity ID, parent hashes, actor/role, command, timestamp,

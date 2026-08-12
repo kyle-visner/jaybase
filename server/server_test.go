@@ -358,7 +358,7 @@ func TestMetadataReplayBindsPaginationToObservedRootAcrossConcurrentAppends(t *t
 		}
 		roots = append(roots, root)
 	}
-	path := "/v1/events?limit=10&after=" + firstPage.Events[1].Hash + "&root=" + firstPage.Root
+	path := "/v1/events?limit=10&after=%20" + firstPage.Events[1].Hash + "%20&root=%20" + firstPage.Root + "%20"
 	second := api.request(t, http.MethodGet, path, api.tokens["reader-agent"], "", "")
 	if second.Code != http.StatusOK {
 		t.Fatalf("bound page status=%d body=%s", second.Code, second.Body.String())
@@ -466,6 +466,10 @@ func TestSelectivePayloadRetrievalEnforcesBatchAndResponseBounds(t *testing.T) {
 	if oversized.Code != http.StatusInsufficientStorage || !strings.Contains(oversized.Body.String(), `"capacity_exceeded"`) {
 		t.Fatalf("oversized response status=%d body=%s", oversized.Code, oversized.Body.String())
 	}
+	compatibility := api.request(t, http.MethodGet, "/v1/events?include_payload=true", api.tokens["reader-agent"], "", "")
+	if compatibility.Code != http.StatusInsufficientStorage || !strings.Contains(compatibility.Body.String(), `"capacity_exceeded"`) {
+		t.Fatalf("oversized compatibility response status=%d body=%s", compatibility.Code, compatibility.Body.String())
+	}
 	tooMany := make([]string, maxPayloadBatchEvents+1)
 	for i := range tooMany {
 		tooMany[i] = root
@@ -479,6 +483,43 @@ func TestSelectivePayloadRetrievalEnforcesBatchAndResponseBounds(t *testing.T) {
 	batch := normal.request(t, http.MethodPost, "/v1/events/payloads", normal.tokens["reader-agent"], "", string(largeBody))
 	if batch.Code != http.StatusBadRequest || !strings.Contains(batch.Body.String(), `"validation_error"`) {
 		t.Fatalf("oversized batch status=%d body=%s", batch.Code, batch.Body.String())
+	}
+}
+
+func TestPayloadInclusiveCompatibilityReadCapsBatchAndAuditsIdentities(t *testing.T) {
+	api := newTestAPI(t)
+	var roots []string
+	for i := 0; i < maxPayloadBatchEvents+1; i++ {
+		root, err := api.store.Append(jaybase.Context{Actor: "fixture", Role: "writer"}, jaybase.AppendOptions{
+			Type: "fact", Command: "remember", Payload: map[string]int{"sequence": i},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	response := api.request(t, http.MethodGet, "/v1/events?include_payload=true&limit=1000", api.tokens["reader-agent"], "", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("compatibility read status=%d body=%s", response.Code, response.Body.String())
+	}
+	var page struct {
+		Events  []eventResponse `json:"events"`
+		Root    string          `json:"root"`
+		HasMore bool            `json:"has_more"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != maxPayloadBatchEvents || !page.HasMore || page.Root != roots[len(roots)-1] {
+		t.Fatalf("compatibility payload batch was not capped: events=%d has_more=%v root=%s", len(page.Events), page.HasMore, page.Root)
+	}
+	logs := api.logs.String()
+	for _, field := range []string{
+		`"operation":"payload_read"`, `"outcome":"retrieved"`, `"selected_event_count":100`, roots[0], roots[99],
+	} {
+		if !strings.Contains(logs, field) {
+			t.Fatalf("compatibility payload audit field %q missing: %s", field, logs)
+		}
 	}
 }
 

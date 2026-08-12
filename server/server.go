@@ -237,19 +237,27 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	page, err := a.store.MetadataEventPageAt(r.URL.Query().Get("after"), r.URL.Query().Get("root"), limit)
+	includePayload := r.URL.Query().Get("include_payload") == "true"
+	if includePayload && limit > maxPayloadBatchEvents {
+		limit = maxPayloadBatchEvents
+	}
+	after := strings.TrimSpace(r.URL.Query().Get("after"))
+	root := strings.TrimSpace(r.URL.Query().Get("root"))
+	page, err := a.store.MetadataEventPageAt(after, root, limit)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	includePayload := r.URL.Query().Get("include_payload") == "true"
 	var pagePayloads map[string]json.RawMessage
-	if includePayload && len(page.Nodes) > 0 {
-		eventIDs := make([]string, 0, len(page.Nodes))
+	eventIDs := make([]string, 0, len(page.Nodes))
+	if includePayload {
 		for _, node := range page.Nodes {
 			eventIDs = append(eventIDs, node.Hash)
 		}
-		payloads, err := a.store.EventPayloads(eventIDs, page.Root)
+		setPayloadReadAudit(w, "failed", page.Root, eventIDs)
+	}
+	if includePayload && len(page.Nodes) > 0 {
+		payloads, err := a.store.EventPayloadsBounded(eventIDs, page.Root, a.maxBody)
 		if err != nil {
 			writeAPIError(w, err)
 			return
@@ -272,9 +280,24 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		}
 		events = append(events, event)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"events": events, "root": page.Root, "has_more": page.HasMore,
-	})
+	}
+	if !includePayload {
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if int64(len(encoded)) > a.maxBody {
+		writeError(w, http.StatusInsufficientStorage, jaybase.ErrCapacity, "payload response exceeds the configured size limit")
+		return
+	}
+	setPayloadReadAudit(w, "retrieved", page.Root, eventIDs)
+	writeRawJSON(w, http.StatusOK, encoded)
 }
 
 type payloadBatchRequest struct {
@@ -652,7 +675,6 @@ func setPayloadReadAudit(w http.ResponseWriter, outcome, root string, eventIDs [
 		recorder.operation = "payload_read"
 		recorder.outcome = outcome
 		recorder.root = root
-		recorder.payloadsRead = len(eventIDs)
 		recorder.selectedIDs = append([]string(nil), eventIDs...)
 	}
 }
@@ -680,7 +702,7 @@ func (a *API) accessLog(next http.Handler) http.Handler {
 				"root", recorder.root, "nodes", recorder.nodes)
 		}
 		if recorder.operation == "payload_read" {
-			attributes = append(attributes, "selected_event_count", recorder.payloadsRead,
+			attributes = append(attributes, "selected_event_count", len(recorder.selectedIDs),
 				"selected_event_ids", recorder.selectedIDs)
 		}
 		a.logger.Info("request", attributes...)

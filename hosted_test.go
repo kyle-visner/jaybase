@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestAppendAtSerializesConcurrentWriters(t *testing.T) {
@@ -242,6 +243,55 @@ func TestBDDEventPageReadsOnlyTheRequestedWindow(t *testing.T) {
 	}
 	if _, err := store.EventPayloads([]string{roots[2]}, roots[3]); err == nil {
 		t.Fatal("expected selective retrieval of the corrupt payload to fail integrity verification")
+	}
+}
+
+func TestEventPayloadSelectionReleasesStoreLockBeforeNodeRead(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	root, err := store.Append(Context{Actor: "agent"}, AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readStarted := make(chan struct{})
+	releaseRead := make(chan struct{})
+	readDone := make(chan error, 1)
+	go func() {
+		_, readErr := store.eventPayloadsWithReader([]string{root}, root, 1024, func(hash string) (Node, error) {
+			close(readStarted)
+			<-releaseRead
+			return store.readNode(hash)
+		})
+		readDone <- readErr
+	}()
+	<-readStarted
+
+	appendDone := make(chan error, 1)
+	go func() {
+		_, appendErr := store.Append(Context{Actor: "writer"}, AppendOptions{
+			Type: "fact", Command: "remember", Payload: map[string]int{"sequence": 2},
+		})
+		appendDone <- appendErr
+	}()
+	select {
+	case err := <-appendDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(releaseRead)
+		<-readDone
+		t.Fatal("payload node read held the store lock and blocked an append")
+	}
+	close(releaseRead)
+	if err := <-readDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
