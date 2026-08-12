@@ -132,8 +132,9 @@ curl -fsS -X POST "$JAYBASE_URL/v1/events" \
   }'
 ```
 
-See the [API guide](docs/api.md) for reads, pagination, refs, snapshots, and
-administrative endpoints.
+See the [API guide](docs/api.md) for metadata-first replay, selective bounded
+payload reads, stable-root pagination, refs, snapshots, and administrative
+endpoints.
 
 ### Use the embedded Go library
 

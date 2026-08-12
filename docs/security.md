@@ -105,8 +105,10 @@ writes. Never keep the only pin on the Jaybase volume.
   a backstop, not volumetric denial-of-service protection.
 - Send JSON logs to a restricted destination. Jaybase never logs bodies or
   Authorization headers. Event reads record `include_payload`, the actual
-  `payloads_decrypted` count, `limit`, and `after_present`; verify, snapshot, and
-  root checks record outcome, root, node count, and duration.
+  `payloads_decrypted` count, `limit`, and `after_present`. Selective payload
+  reads record the principal, outcome, observed root, bounded selected count,
+  and event identities without plaintext. Verify, snapshot, and root checks
+  record outcome, root, node count, and duration.
 - Alert on bursts of `401`, any `429`, failed admin outcomes, and unexpected
   payload-reading principals.
 - Export every snapshot off-host, retain multiple generations, and compare pins.

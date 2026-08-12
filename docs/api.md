@@ -58,13 +58,23 @@ Query parameters:
 
 - `limit`: 1-1000, default 100.
 - `after`: return nodes strictly after this hash in the current history.
+- `root`: optional observed root that bounds the page. Capture it from the first
+  page and send it on every later page of the same scan.
 - `include_payload=true`: decrypt and include payloads. Payloads are omitted by
   default.
 
-The response includes `events`, the current `root`, and `has_more`. The `root`
-is the live history tip captured atomically with that page. `has_more` says
-whether more events followed the returned page at the time of that request; a
-concurrent append can therefore change both values on a later page.
+Each event includes `event_id` and `hash` (the same opaque content identity in
+this version), type, entity ID, parent hashes, actor/role, command, timestamp,
+and request ID. Metadata-only pages do not decrypt or authenticate sealed
+payloads. They therefore remain usable when an unrelated payload is corrupt;
+payload authentication is deferred until that event is selected.
+
+The response includes `events`, `root`, and `has_more`. Without a `root` query,
+`root` is the live history tip captured atomically with the page. With a `root`
+query, both the returned events and `has_more` are bounded to that exact observed
+root, even when concurrent appends advance the live history. An absent observed
+root or an `after` cursor beyond it returns `409 conflict`; an unknown `after`
+cursor returns `404 not_found`.
 
 For a concurrency-safe incremental replay:
 
@@ -74,21 +84,50 @@ For a concurrency-safe incremental replay:
 2. If the first response has no events, stop before entering the pagination
    loop. The client is already caught up when `root` equals its checkpoint; an
    empty store likewise returns an empty target and no events.
-3. Otherwise, apply events in order. If an event's hash equals the captured
-   target, stop immediately; do not apply later events from the same response.
-4. Until the target is reached, request another page with the final applied
-   event hash as `after`. Later responses may report a newer `root`; keep the
-   original target.
-5. After reaching the target, persist that target (equivalently, the last
-   applied event hash) as the new client checkpoint. Never persist a newer root
-   reported by a later page unless the client also applied through that event.
+3. Otherwise, classify the metadata and request later pages with both the final
+   event ID as `after` and the captured target as `root`.
+4. Fetch only needed payloads through the bounded endpoint below, apply events
+   in chain order, and persist the target after all selected facts through it
+   have been applied.
 
-Jaybase's history is a linear append-only chain, so the captured target remains
+Jaybase's history is a linear append-only chain, so a captured target remains
 reachable when a concurrent writer advances the live root. A cached `after`
 hash that is not in the current history returns structured `404 not_found`; the
 client must invalidate that checkpoint and perform a cold replay. This can
 happen after restoring or replacing a store. Payload omission and
 `include_payload=true` behave identically during bounded replay.
+
+## Selective payload retrieval
+
+`POST /v1/events/payloads` requires `reader` and `Content-Type:
+application/json`:
+
+```json
+{
+  "root": "sha256:observed-replay-root",
+  "event_ids": ["sha256:first-event", "sha256:second-event"]
+}
+```
+
+The request must contain 1-100 unique event identities. Every identity must
+belong to this store and occur at or before `root`. Results retain request order
+and include integrity-checked plaintext:
+
+```json
+{
+  "root": "sha256:observed-replay-root",
+  "payloads": [
+    {"event_id":"sha256:first-event","hash":"sha256:first-event","payload":{"status":"active"}}
+  ]
+}
+```
+
+The JSON response may not exceed the server's configured application body
+limit (1 MiB by default); an oversized result returns `507 capacity_exceeded`.
+The normal authenticated per-principal rate limit and HTTP read/write timeouts
+also apply. Audit logs record the principal, observed root, selected count, and
+event identities, but never plaintext. A corrupt selected event returns
+`500 integrity_error`; corrupt events not selected do not affect the batch.
 
 ## Named refs
 

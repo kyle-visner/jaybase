@@ -234,7 +234,14 @@ func TestBDDEventPageReadsOnlyTheRequestedWindow(t *testing.T) {
 		t.Fatalf("unexpected first page: %#v", page)
 	}
 	if _, err := store.EventPage(roots[1], 2); err == nil {
-		t.Fatal("expected a page containing the corrupt node to fail integrity verification")
+		t.Fatal("compatibility event page stopped verifying selected node integrity")
+	}
+	page, err = store.MetadataEventPageAt(roots[1], roots[3], 2)
+	if err != nil || len(page.Nodes) != 2 || page.Nodes[0].Hash != roots[2] {
+		t.Fatalf("metadata replay was blocked by corrupt payload: page=%#v err=%v", page, err)
+	}
+	if _, err := store.EventPayloads([]string{roots[2]}, roots[3]); err == nil {
+		t.Fatal("expected selective retrieval of the corrupt payload to fail integrity verification")
 	}
 }
 

@@ -322,6 +322,166 @@ func TestBDDIncrementalEventReplayKeepsTheFirstRootAsItsBoundary(t *testing.T) {
 	}
 }
 
+func TestMetadataReplayBindsPaginationToObservedRootAcrossConcurrentAppends(t *testing.T) {
+	api := newTestAPI(t)
+	var roots []string
+	for i := 0; i < 4; i++ {
+		root, err := api.store.Append(jaybase.Context{Actor: "fixture", Role: "writer"}, jaybase.AppendOptions{
+			Type: fmt.Sprintf("app.%d.fact", i%2), Command: "remember", Payload: map[string]int{"sequence": i},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	first := api.request(t, http.MethodGet, "/v1/events?limit=2", api.tokens["reader-agent"], "", "")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	var firstPage struct {
+		Events  []eventResponse `json:"events"`
+		Root    string          `json:"root"`
+		HasMore bool            `json:"has_more"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPage); err != nil {
+		t.Fatal(err)
+	}
+	if firstPage.Root != roots[3] || len(firstPage.Events) != 2 || !firstPage.HasMore {
+		t.Fatalf("unexpected first page: %#v", firstPage)
+	}
+	for i := 4; i < 6; i++ {
+		root, err := api.store.Append(jaybase.Context{Actor: "concurrent", Role: "writer"}, jaybase.AppendOptions{
+			Type: "other.fact", Command: "remember", Payload: map[string]int{"sequence": i},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	path := "/v1/events?limit=10&after=" + firstPage.Events[1].Hash + "&root=" + firstPage.Root
+	second := api.request(t, http.MethodGet, path, api.tokens["reader-agent"], "", "")
+	if second.Code != http.StatusOK {
+		t.Fatalf("bound page status=%d body=%s", second.Code, second.Body.String())
+	}
+	var secondPage struct {
+		Events  []eventResponse `json:"events"`
+		Root    string          `json:"root"`
+		HasMore bool            `json:"has_more"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPage); err != nil {
+		t.Fatal(err)
+	}
+	if secondPage.Root != roots[3] || len(secondPage.Events) != 2 || secondPage.HasMore || secondPage.Events[1].Hash != roots[3] {
+		t.Fatalf("bound page mixed histories: %#v", secondPage)
+	}
+	beyond := api.request(t, http.MethodGet, "/v1/events?after="+roots[5]+"&root="+roots[3], api.tokens["reader-agent"], "", "")
+	if beyond.Code != http.StatusConflict || !strings.Contains(beyond.Body.String(), `"conflict"`) {
+		t.Fatalf("cursor beyond observed root status=%d body=%s", beyond.Code, beyond.Body.String())
+	}
+	payloadBody, err := json.Marshal(payloadBatchRequest{Root: roots[3], EventIDs: []string{roots[5]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	futurePayload := api.request(t, http.MethodPost, "/v1/events/payloads", api.tokens["reader-agent"], "", string(payloadBody))
+	if futurePayload.Code != http.StatusConflict {
+		t.Fatalf("payload beyond observed root status=%d body=%s", futurePayload.Code, futurePayload.Body.String())
+	}
+	missingID := "sha256:" + strings.Repeat("0", 64)
+	missingBody, err := json.Marshal(payloadBatchRequest{Root: roots[3], EventIDs: []string{missingID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingPayload := api.request(t, http.MethodPost, "/v1/events/payloads", api.tokens["reader-agent"], "", string(missingBody))
+	if missingPayload.Code != http.StatusNotFound {
+		t.Fatalf("foreign event identity status=%d body=%s", missingPayload.Code, missingPayload.Body.String())
+	}
+}
+
+func TestSelectivePayloadRetrievalSkipsCorruptForeignPayloadAndAuditsIdentities(t *testing.T) {
+	api := newTestAPI(t)
+	types := []string{"magpie.journal.posted.v1", "foreign.corrupt.v1", "martin.deal.created.v1"}
+	secrets := []string{"magpie-secret", "foreign-secret", "martin-secret"}
+	var roots []string
+	for i := range types {
+		root, err := api.store.Append(jaybase.Context{Actor: "fixture", Role: "writer"}, jaybase.AppendOptions{
+			Type: types[i], Command: "assert", Payload: map[string]string{"value": secrets[i]},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	raw, err := os.ReadFile(api.store.NodePath(roots[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(api.store.NodePath(roots[1]), []byte(strings.Replace(string(raw), "ciphertext", "ciphertexu", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := api.request(t, http.MethodGet, "/v1/events?limit=10&root="+roots[2], api.tokens["reader-agent"], "", "")
+	if metadata.Code != http.StatusOK || !strings.Contains(metadata.Body.String(), types[1]) || strings.Contains(metadata.Body.String(), "foreign-secret") {
+		t.Fatalf("metadata replay status=%d body=%s", metadata.Code, metadata.Body.String())
+	}
+	bodyBytes, err := json.Marshal(payloadBatchRequest{Root: roots[2], EventIDs: []string{roots[0], roots[2]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized := api.request(t, http.MethodPost, "/v1/events/payloads", "", "", string(bodyBytes))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized payload status=%d", unauthorized.Code)
+	}
+	selected := api.request(t, http.MethodPost, "/v1/events/payloads", api.tokens["reader-agent"], "", string(bodyBytes))
+	if selected.Code != http.StatusOK || !strings.Contains(selected.Body.String(), "magpie-secret") || !strings.Contains(selected.Body.String(), "martin-secret") || strings.Contains(selected.Body.String(), "foreign-secret") {
+		t.Fatalf("selected payload status=%d body=%s", selected.Code, selected.Body.String())
+	}
+	corruptBody, err := json.Marshal(payloadBatchRequest{Root: roots[2], EventIDs: []string{roots[1]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := api.request(t, http.MethodPost, "/v1/events/payloads", api.tokens["reader-agent"], "", string(corruptBody))
+	if corrupt.Code != http.StatusInternalServerError || !strings.Contains(corrupt.Body.String(), `"integrity_error"`) {
+		t.Fatalf("corrupt selected payload status=%d body=%s", corrupt.Code, corrupt.Body.String())
+	}
+	logs := api.logs.String()
+	if !strings.Contains(logs, `"operation":"payload_read"`) || !strings.Contains(logs, `"selected_event_count":2`) ||
+		!strings.Contains(logs, roots[0]) || !strings.Contains(logs, roots[2]) || strings.Contains(logs, "magpie-secret") {
+		t.Fatalf("payload audit fields missing or plaintext leaked: %s", logs)
+	}
+}
+
+func TestSelectivePayloadRetrievalEnforcesBatchAndResponseBounds(t *testing.T) {
+	api := newTestAPIWithOptions(t, func(options *Options) { options.MaxBodyBytes = 512 })
+	root, err := api.store.Append(jaybase.Context{Actor: "fixture", Role: "writer"}, jaybase.AppendOptions{
+		Type: "fact", Command: "remember", Payload: map[string]string{"value": strings.Repeat("x", 400)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyBytes, err := json.Marshal(payloadBatchRequest{Root: root, EventIDs: []string{root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := api.request(t, http.MethodPost, "/v1/events/payloads", api.tokens["reader-agent"], "", string(bodyBytes))
+	if oversized.Code != http.StatusInsufficientStorage || !strings.Contains(oversized.Body.String(), `"capacity_exceeded"`) {
+		t.Fatalf("oversized response status=%d body=%s", oversized.Code, oversized.Body.String())
+	}
+	tooMany := make([]string, maxPayloadBatchEvents+1)
+	for i := range tooMany {
+		tooMany[i] = root
+	}
+	largeBody, err := json.Marshal(payloadBatchRequest{Root: root, EventIDs: tooMany})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use a normally configured API so the request itself is within its body limit.
+	normal := newTestAPI(t)
+	batch := normal.request(t, http.MethodPost, "/v1/events/payloads", normal.tokens["reader-agent"], "", string(largeBody))
+	if batch.Code != http.StatusBadRequest || !strings.Contains(batch.Body.String(), `"validation_error"`) {
+		t.Fatalf("oversized batch status=%d body=%s", batch.Code, batch.Body.String())
+	}
+}
+
 func TestBDDOversizedJSONReturnsOneStructured413(t *testing.T) {
 	api := newTestAPIWithOptions(t, func(options *Options) { options.MaxBodyBytes = 64 })
 	body := `{"type":"fact","command":"remember","payload":{"value":"` + strings.Repeat("x", 128) + `"},"expected_root":""}`
