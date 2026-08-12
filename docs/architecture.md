@@ -65,6 +65,17 @@ indexes for event position and request identity. That startup work is linear in
 history size. It makes idempotent replay lookup constant-time and lets the read
 API load only the requested page instead of materializing the full history.
 
+Replay separates metadata discovery from payload access. A metadata page reads
+ordered identity, parent, type, actor/role, command, and timestamp fields from
+the verified in-memory index without reopening, decrypting, or authenticating
+sealed payloads. Clients bind subsequent pages
+to the first observed root, classify domain events, then retrieve selected
+payloads by opaque event identity in bounded batches. Selected reads verify the
+full content address and AES-GCM authentication before returning plaintext. This
+means a damaged or key-mismatched foreign payload does not block another
+application's metadata scan or valid selected payloads. Full administrative
+verification still authenticates every reachable node and payload.
+
 ## Scaling boundary
 
 The reference deployment scales clients, not writers. It is appropriate for a

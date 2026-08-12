@@ -26,6 +26,7 @@ const defaultMaxBodyBytes int64 = 1 << 20
 const defaultSnapshotRetention = 24
 const defaultRateLimitPerMinute = 600
 const defaultFailedAuthLimitPerMinute = 30
+const maxPayloadBatchEvents = 100
 
 type Options struct {
 	Store                    *jaybase.Store
@@ -105,6 +106,7 @@ func (a *API) routes() {
 	a.mux.HandleFunc("GET /health/ready", a.ready)
 	a.mux.Handle("GET /v1/root", a.require(RoleReader, http.HandlerFunc(a.root)))
 	a.mux.Handle("GET /v1/events", a.require(RoleReader, http.HandlerFunc(a.events)))
+	a.mux.Handle("POST /v1/events/payloads", a.require(RoleReader, http.HandlerFunc(a.eventPayloads)))
 	a.mux.Handle("POST /v1/events", a.requireMutation(RoleWriter, http.HandlerFunc(a.appendEvent)))
 	a.mux.Handle("GET /v1/refs/{name}", a.require(RoleReader, http.HandlerFunc(a.getNamedRef)))
 	a.mux.Handle("PUT /v1/refs/{name}", a.requireMutation(RoleWriter, http.HandlerFunc(a.putNamedRef)))
@@ -212,6 +214,7 @@ func (a *API) appendEvent(w http.ResponseWriter, r *http.Request) {
 
 type eventResponse struct {
 	Schema    int             `json:"schema"`
+	EventID   string          `json:"event_id"`
 	Hash      string          `json:"hash"`
 	Type      string          `json:"type"`
 	EntityID  string          `json:"entity_id,omitempty"`
@@ -234,33 +237,142 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	page, err := a.store.EventPage(r.URL.Query().Get("after"), limit)
+	includePayload := r.URL.Query().Get("include_payload") == "true"
+	if includePayload && limit > maxPayloadBatchEvents {
+		limit = maxPayloadBatchEvents
+	}
+	after := strings.TrimSpace(r.URL.Query().Get("after"))
+	root := strings.TrimSpace(r.URL.Query().Get("root"))
+	page, err := a.store.MetadataEventPageAt(after, root, limit)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	includePayload := r.URL.Query().Get("include_payload") == "true"
+	var pagePayloads map[string]json.RawMessage
+	eventIDs := make([]string, 0, len(page.Nodes))
+	if includePayload {
+		for _, node := range page.Nodes {
+			eventIDs = append(eventIDs, node.Hash)
+		}
+		setPayloadReadAudit(w, "failed", page.Root, eventIDs)
+	}
+	if includePayload && len(page.Nodes) > 0 {
+		payloads, err := a.store.EventPayloadsBounded(eventIDs, page.Root, a.maxBody)
+		if err != nil {
+			writeAPIError(w, err)
+			return
+		}
+		pagePayloads = make(map[string]json.RawMessage, len(payloads))
+		for _, item := range payloads {
+			pagePayloads[item.EventID] = json.RawMessage(item.Payload)
+		}
+	}
 	events := make([]eventResponse, 0, len(page.Nodes))
 	for _, node := range page.Nodes {
 		event := eventResponse{
-			Schema: node.Schema, Hash: node.Hash, Type: node.Type, EntityID: node.EntityID,
+			Schema: node.Schema, EventID: node.Hash, Hash: node.Hash, Type: node.Type, EntityID: node.EntityID,
 			Parents: node.Parents, Actor: node.Actor, Role: node.Role, Command: node.Command,
 			CreatedAt: node.CreatedAt, RequestID: node.RequestID,
 		}
 		if includePayload {
-			payload, err := a.store.NodePayload(node)
-			if err != nil {
-				writeAPIError(w, err)
-				return
-			}
-			event.Payload = payload
+			event.Payload = pagePayloads[node.Hash]
 			addPayloadRead(w)
 		}
 		events = append(events, event)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"events": events, "root": page.Root, "has_more": page.HasMore,
-	})
+	}
+	if !includePayload {
+		writeJSON(w, http.StatusOK, response)
+		return
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if int64(len(encoded)) > a.maxBody {
+		writeError(w, http.StatusInsufficientStorage, jaybase.ErrCapacity, "payload response exceeds the configured size limit")
+		return
+	}
+	setPayloadReadAudit(w, "retrieved", page.Root, eventIDs)
+	writeRawJSON(w, http.StatusOK, encoded)
+}
+
+type payloadBatchRequest struct {
+	Root     string   `json:"root"`
+	EventIDs []string `json:"event_ids"`
+}
+
+type payloadResponse struct {
+	EventID string          `json:"event_id"`
+	Hash    string          `json:"hash"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+func (a *API) eventPayloads(w http.ResponseWriter, r *http.Request) {
+	if !hasJSONContentType(r) {
+		writeError(w, http.StatusUnsupportedMediaType, jaybase.ErrValidation, "Content-Type must be application/json")
+		return
+	}
+	var request payloadBatchRequest
+	if err := decodeJSON(w, r, a.maxBody, &request); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	request.Root = strings.TrimSpace(request.Root)
+	for i := range request.EventIDs {
+		request.EventIDs[i] = strings.TrimSpace(request.EventIDs[i])
+	}
+	if len(request.EventIDs) < 1 || len(request.EventIDs) > maxPayloadBatchEvents {
+		writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "event_ids must contain between 1 and 100 identities")
+		return
+	}
+	if !validEventID(request.Root) {
+		writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "root must be a SHA-256 event identity")
+		return
+	}
+	for _, eventID := range request.EventIDs {
+		if !validEventID(eventID) {
+			writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "event_ids must contain SHA-256 event identities")
+			return
+		}
+	}
+	setPayloadReadAudit(w, "failed", request.Root, request.EventIDs)
+	payloads, err := a.store.EventPayloadsBounded(request.EventIDs, request.Root, a.maxBody)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	response := struct {
+		Root     string            `json:"root"`
+		Payloads []payloadResponse `json:"payloads"`
+	}{Root: request.Root, Payloads: make([]payloadResponse, 0, len(payloads))}
+	for _, item := range payloads {
+		response.Payloads = append(response.Payloads, payloadResponse{
+			EventID: item.EventID, Hash: item.EventID, Payload: json.RawMessage(item.Payload),
+		})
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		writeAPIError(w, err)
+		return
+	}
+	if int64(len(encoded)) > a.maxBody {
+		writeError(w, http.StatusInsufficientStorage, jaybase.ErrCapacity, "payload response exceeds the configured size limit")
+		return
+	}
+	setPayloadReadAudit(w, "retrieved", request.Root, request.EventIDs)
+	writeRawJSON(w, http.StatusOK, encoded)
+}
+
+func validEventID(value string) bool {
+	if len(value) != len("sha256:")+sha256.Size*2 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	decoded, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil && len(decoded) == sha256.Size
 }
 
 func (a *API) getNamedRef(w http.ResponseWriter, r *http.Request) {
@@ -512,6 +624,12 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+func writeRawJSON(w http.ResponseWriter, status int, value []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(value)
+}
+
 type responseRecorder struct {
 	http.ResponseWriter
 	status       int
@@ -522,6 +640,7 @@ type responseRecorder struct {
 	root         string
 	nodes        int
 	payloadsRead int
+	selectedIDs  []string
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
@@ -551,6 +670,15 @@ func addPayloadRead(w http.ResponseWriter) {
 	}
 }
 
+func setPayloadReadAudit(w http.ResponseWriter, outcome, root string, eventIDs []string) {
+	if recorder, ok := w.(*responseRecorder); ok {
+		recorder.operation = "payload_read"
+		recorder.outcome = outcome
+		recorder.root = root
+		recorder.selectedIDs = append([]string(nil), eventIDs...)
+	}
+}
+
 func (a *API) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
@@ -572,6 +700,10 @@ func (a *API) accessLog(next http.Handler) http.Handler {
 		if recorder.operation != "" {
 			attributes = append(attributes, "operation", recorder.operation, "outcome", recorder.outcome,
 				"root", recorder.root, "nodes", recorder.nodes)
+		}
+		if recorder.operation == "payload_read" {
+			attributes = append(attributes, "selected_event_count", len(recorder.selectedIDs),
+				"selected_event_ids", recorder.selectedIDs)
 		}
 		a.logger.Info("request", attributes...)
 	})

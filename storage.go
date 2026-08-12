@@ -52,6 +52,7 @@ type Store struct {
 	mu           sync.RWMutex
 	lock         *storeLock
 	history      []string
+	metadata     []Node
 	historyIndex map[string]int
 	requestIndex map[string]requestRecord
 }
@@ -70,6 +71,14 @@ type EventPage struct {
 	// HasMore reports whether more events followed this page at the time of this
 	// read. A concurrent append can change it on a later request.
 	HasMore bool
+}
+
+// EventPayload is a plaintext payload retrieved by opaque event identity. The
+// identity is currently the event's content hash; callers must treat it as an
+// opaque value and must not derive storage paths from it.
+type EventPayload struct {
+	EventID string
+	Payload []byte
 }
 
 type Context struct {
@@ -211,10 +220,12 @@ func (s *Store) rebuildIndexes() error {
 		return err
 	}
 	s.history = make([]string, 0, len(nodes))
+	s.metadata = make([]Node, 0, len(nodes))
 	s.historyIndex = make(map[string]int, len(nodes))
 	s.requestIndex = make(map[string]requestRecord)
 	for i, node := range nodes {
 		s.history = append(s.history, node.Hash)
+		s.metadata = append(s.metadata, replayMetadata(node))
 		s.historyIndex[node.Hash] = i
 		if node.RequestID == "" {
 			continue
@@ -455,6 +466,7 @@ func (s *Store) append(ctx Context, opts AppendOptions, expectedRoot *string) (s
 	}
 	s.historyIndex[hash] = len(s.history)
 	s.history = append(s.history, hash)
+	s.metadata = append(s.metadata, replayMetadata(node))
 	if node.RequestID != "" {
 		s.requestIndex[node.RequestID] = requestRecord{Hash: hash, RequestHash: node.RequestHash}
 	}
@@ -485,6 +497,14 @@ func (s *Store) readNode(hash string) (Node, error) {
 		return node, err
 	}
 	return node, nil
+}
+
+func replayMetadata(node Node) Node {
+	return Node{
+		Schema: node.Schema, Hash: node.Hash, Type: node.Type, EntityID: node.EntityID,
+		Parents: append([]string(nil), node.Parents...), Actor: node.Actor, Role: node.Role,
+		Command: node.Command, CreatedAt: node.CreatedAt, RequestID: node.RequestID,
+	}
 }
 
 func verifyNode(node Node) error {
@@ -568,6 +588,22 @@ func (s *Store) AuditLog() ([]Node, error) {
 // Root and stop exactly when that event is reached even if concurrent appends
 // advance the root between page requests.
 func (s *Store) EventPage(after string, limit int) (EventPage, error) {
+	return s.eventPageAt(after, "", limit, false)
+}
+
+// MetadataEventPageAt returns a metadata-only page bounded by observedRoot.
+// When observedRoot is empty, the current root is captured. Supplying the
+// captured root on later calls prevents concurrent appends from changing the
+// scan's contents or has-more result.
+//
+// Metadata reads deliberately do not authenticate or decrypt sealed payloads.
+// Payload integrity is checked only by EventPayloads, NodePayload, or VerifyAll,
+// so damage to an unselected payload cannot make metadata replay unavailable.
+func (s *Store) MetadataEventPageAt(after, observedRoot string, limit int) (EventPage, error) {
+	return s.eventPageAt(after, observedRoot, limit, true)
+}
+
+func (s *Store) eventPageAt(after, observedRoot string, limit int, metadataOnly bool) (EventPage, error) {
 	if limit < 1 {
 		return EventPage{}, appErr(ErrValidation, "event page limit must be positive")
 	}
@@ -580,27 +616,141 @@ func (s *Store) EventPage(after string, limit int) (EventPage, error) {
 	if root != s.indexedRoot() {
 		return EventPage{}, appErr(ErrIntegrity, "current root does not match the in-memory history index")
 	}
+	targetEnd := len(s.history)
+	if observedRoot != "" {
+		if err := validateHash(observedRoot); err != nil {
+			return EventPage{}, err
+		}
+		position, ok := s.historyIndex[observedRoot]
+		if !ok {
+			return EventPage{}, appErr(ErrConflict, "observed root is not in the current history")
+		}
+		targetEnd = position + 1
+		root = observedRoot
+	}
 	start := 0
 	if after != "" {
 		position, ok := s.historyIndex[after]
 		if !ok {
 			return EventPage{}, appErr(ErrNotFound, "after root was not found in the current history")
 		}
+		if position >= targetEnd {
+			return EventPage{}, appErr(ErrConflict, "after cursor is beyond the observed root")
+		}
 		start = position + 1
 	}
 	end := start + limit
-	if end > len(s.history) {
-		end = len(s.history)
+	if end > targetEnd {
+		end = targetEnd
 	}
 	nodes := make([]Node, 0, end-start)
-	for _, hash := range s.history[start:end] {
-		node, err := s.readNode(hash)
+	for offset, hash := range s.history[start:end] {
+		var node Node
+		var err error
+		if metadataOnly {
+			node = replayMetadata(s.metadata[start+offset])
+		} else {
+			node, err = s.readNode(hash)
+		}
 		if err != nil {
 			return EventPage{}, err
 		}
 		nodes = append(nodes, node)
 	}
-	return EventPage{Nodes: nodes, Root: root, HasMore: end < len(s.history)}, nil
+	return EventPage{Nodes: nodes, Root: root, HasMore: end < targetEnd}, nil
+}
+
+// EventPayloads retrieves and authenticates payloads in request order. Every
+// event must belong to this store and be at or before observedRoot. The caller
+// owns batch and response-size limits. Membership and boundary checks are
+// atomic under the store read lock; immutable node reads and decryption happen
+// after releasing it so readers do not delay appends.
+func (s *Store) EventPayloads(eventIDs []string, observedRoot string) ([]EventPayload, error) {
+	return s.eventPayloads(eventIDs, observedRoot, 0)
+}
+
+// EventPayloadsBounded applies a cumulative plaintext byte limit while
+// decrypting, before retaining an oversized batch in memory.
+func (s *Store) EventPayloadsBounded(eventIDs []string, observedRoot string, maxBytes int64) ([]EventPayload, error) {
+	if maxBytes < 1 {
+		return nil, appErr(ErrValidation, "payload byte limit must be positive")
+	}
+	return s.eventPayloads(eventIDs, observedRoot, maxBytes)
+}
+
+func (s *Store) eventPayloads(eventIDs []string, observedRoot string, maxBytes int64) ([]EventPayload, error) {
+	return s.eventPayloadsWithReader(eventIDs, observedRoot, maxBytes, s.readNode)
+}
+
+func (s *Store) eventPayloadsWithReader(eventIDs []string, observedRoot string, maxBytes int64, readNode func(string) (Node, error)) ([]EventPayload, error) {
+	if len(eventIDs) == 0 {
+		return nil, appErr(ErrValidation, "at least one event ID is required")
+	}
+	if err := validateHash(observedRoot); err != nil {
+		return nil, appErr(ErrValidation, "a valid observed root is required")
+	}
+	selected, err := s.selectPayloadEventIDs(eventIDs, observedRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	// Node objects are immutable after their atomic creation. The selection
+	// helper has released the store lock before disk I/O and AES-GCM work so
+	// payload reads do not delay appends.
+	result := make([]EventPayload, 0, len(selected))
+	var payloadBytes int64
+	for _, eventID := range selected {
+		node, err := readNode(eventID)
+		if err != nil {
+			return nil, err
+		}
+		payload, err := s.nodePayload(node)
+		if err != nil {
+			return nil, err
+		}
+		if maxBytes > 0 && int64(len(payload)) > maxBytes-payloadBytes {
+			return nil, appErr(ErrCapacity, "payload response exceeds the configured size limit")
+		}
+		payloadBytes += int64(len(payload))
+		result = append(result, EventPayload{EventID: eventID, Payload: payload})
+	}
+	return result, nil
+}
+
+func (s *Store) selectPayloadEventIDs(eventIDs []string, observedRoot string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	current, err := s.currentRoot()
+	if err != nil {
+		return nil, err
+	}
+	if current != s.indexedRoot() {
+		return nil, appErr(ErrIntegrity, "current root does not match the in-memory history index")
+	}
+	target, ok := s.historyIndex[observedRoot]
+	if !ok {
+		return nil, appErr(ErrConflict, "observed root is not in the current history")
+	}
+	seen := make(map[string]struct{}, len(eventIDs))
+	selected := make([]string, 0, len(eventIDs))
+	for _, eventID := range eventIDs {
+		if err := validateHash(eventID); err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[eventID]; duplicate {
+			return nil, appErr(ErrValidation, "duplicate event ID %s", eventID)
+		}
+		seen[eventID] = struct{}{}
+		position, exists := s.historyIndex[eventID]
+		if !exists {
+			return nil, appErr(ErrNotFound, "event ID was not found in this store")
+		}
+		if position > target {
+			return nil, appErr(ErrConflict, "event ID is beyond the observed root")
+		}
+		selected = append(selected, eventID)
+	}
+	return selected, nil
 }
 
 func (s *Store) NodePayload(node Node) ([]byte, error) {
