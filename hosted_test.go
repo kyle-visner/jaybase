@@ -3,7 +3,10 @@ package jaybase
 import (
 	"archive/tar"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -243,6 +246,84 @@ func TestBDDEventPageReadsOnlyTheRequestedWindow(t *testing.T) {
 	}
 	if _, err := store.EventPayloads([]string{roots[2]}, roots[3]); err == nil {
 		t.Fatal("expected selective retrieval of the corrupt payload to fail integrity verification")
+	}
+}
+
+func TestMetadataReplaySkipsKeyMismatchedPayloadAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roots []string
+	for i, nodeType := range []string{"magpie.fact", "foreign.fact", "martin.fact"} {
+		root, appendErr := store.Append(Context{Actor: "fixture", Role: "writer"}, AppendOptions{
+			Type: nodeType, Command: "remember", Payload: map[string]int{"sequence": i},
+		})
+		if appendErr != nil {
+			t.Fatal(appendErr)
+		}
+		roots = append(roots, root)
+	}
+	nodes, err := store.NodesFromRoot(roots[len(roots)-1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongKey := append([]byte(nil), store.key...)
+	wrongKey[0] ^= 0xff
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes[1].SealedPayload, err = encryptPayload(wrongKey, []byte(`{"sequence":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rehash := func(node *Node) {
+		content := nodeContent{
+			Schema: node.Schema, Type: node.Type, EntityID: node.EntityID, Parents: node.Parents,
+			Payload: node.Payload, SealedPayload: node.SealedPayload, Actor: node.Actor, Role: node.Role,
+			Command: node.Command, CreatedAt: node.CreatedAt, RequestID: node.RequestID, RequestHash: node.RequestHash,
+		}
+		encoded, marshalErr := json.Marshal(content)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		sum := sha256.Sum256(encoded)
+		node.Hash = "sha256:" + hex.EncodeToString(sum[:])
+	}
+	rehash(&nodes[1])
+	nodes[2].Parents = []string{nodes[1].Hash}
+	rehash(&nodes[2])
+	for _, node := range nodes[1:] {
+		encoded, marshalErr := json.MarshalIndent(node, "", "  ")
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		path := filepath.Join(dir, "objects", "nodes", strings.TrimPrefix(node.Hash, "sha256:")+".json")
+		if err := os.WriteFile(path, append(encoded, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "refs", "root"), []byte(nodes[2].Hash+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenStore(dir)
+	if err != nil {
+		t.Fatalf("reopen with a key-mismatched non-head payload: %v", err)
+	}
+	defer store.Close()
+	page, err := store.MetadataEventPageAt("", nodes[2].Hash, 10)
+	if err != nil || len(page.Nodes) != 3 || page.Nodes[1].Hash != nodes[1].Hash {
+		t.Fatalf("metadata replay was blocked by key mismatch: page=%#v err=%v", page, err)
+	}
+	payloads, err := store.EventPayloads([]string{nodes[0].Hash, nodes[2].Hash}, nodes[2].Hash)
+	if err != nil || len(payloads) != 2 {
+		t.Fatalf("valid selected payloads were blocked by unselected key mismatch: payloads=%#v err=%v", payloads, err)
+	}
+	if _, err := store.EventPayloads([]string{nodes[1].Hash}, nodes[2].Hash); err == nil {
+		t.Fatal("selected key-mismatched payload unexpectedly decrypted")
 	}
 }
 
