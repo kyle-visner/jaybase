@@ -154,7 +154,9 @@ Production processes must use `OpenStoreWithDataKey`; the server enforces this.
 
 - One process owns each writable data volume.
 - Caddy handles HTTPS; bearer credentials provide `reader`, `writer`, or `admin`
-  access.
+  access. An optional `operator` role manages the catalog and cannot append.
+- Omitted token scopes and an unconfigured catalog preserve open writes. A
+  scoped token, or an enforced catalog, rejects appends outside that boundary.
 - Payloads are encrypted at rest, with the data key stored outside the volume
   and snapshots.
 - Snapshots should be copied off-host.

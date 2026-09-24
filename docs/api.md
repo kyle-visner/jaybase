@@ -7,7 +7,17 @@ All responses are JSON. Routes under `/v1` require
 {"error":{"code":"conflict","message":"root changed"}}
 ```
 
-Roles are cumulative: writers can read; admins can read and write.
+Roles are cumulative for `reader`, `writer`, and `admin`: writers can read;
+admins can read, write, and operate. `operator` is not on that ladder. It can
+manage the catalog and cannot read or append facts. Existing tokens with no
+`allow` block keep role-wide access.
+
+An unconfigured catalog, or a configured catalog that has never been enforced,
+still accepts any event type. Installing a type turns enforcement on. Appends
+must then use an installed type and command. That check does not rewrite
+history. Removing the last type leaves enforcement on, so later appends fail
+closed instead of returning the store to open writes. Host tooling, not the
+HTTP API, can turn enforcement back off.
 
 ## Health
 
@@ -49,6 +59,38 @@ The root is an empty string for a new database.
 `expected_root` is required. Use `""` only for the first event. A successful new
 append returns `201`; an identical retry returns `200` with `replayed: true`.
 A stale root or reused idempotency key with different content returns `409`.
+The credential's actor and role are still taken from the token. Clients cannot
+choose them.
+
+When the token has an `allow` block, the type must match one pattern
+(`namespace.name` or `namespace.*`, one namespace only) and, if `commands` is
+present, the command must be listed exactly. A token with no `allow` block is
+unchanged. Named-ref updates are likewise unchanged unless `allow.refs` is set;
+a ref pattern is an exact file-safe name or a prefix ending in `*`, such as
+`magpie-*`. A mismatch returns `403 permission_denied` and does not append.
+Stop; do not retry the same operation under a different type.
+
+## Catalog
+
+Catalog routes require `operator` (or `admin`) and a configured
+`JAYBASE_CATALOG_FILE`. Without that file they return `503`. They edit the
+catalog file only. They do not append events.
+
+- `GET /v1/admin/catalog` returns `{"enforced":false,"entries":[]}`.
+- `POST /v1/admin/catalog/entries` with
+  `{"type":"magpie.journal","commands":["journal.post"]}` installs one exact
+  type and turns enforcement on. A new type returns `201`. Repeating that
+  install returns `200`.
+- `DELETE /v1/admin/catalog/entries/{type}` removes that type and does not turn
+  enforcement off.
+
+Writers cannot call these routes. An enforced catalog rejects every writer,
+including an unscoped writer or `admin`, when the type or command is not
+installed. `operator` cannot append, so the credential that edits the schema
+cannot also write facts.
+
+`jaybase-server catalog enforce CATALOG_FILE false` is the host escape hatch
+back to open writes. The HTTP API does not expose it.
 
 ## Replay events
 

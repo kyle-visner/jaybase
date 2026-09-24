@@ -11,6 +11,9 @@ services:
       JAYBASE_BACKUP_DIR: /var/backups/jaybase
       JAYBASE_DATA_KEY_FILE: /run/secrets/jaybase_data_key
       JAYBASE_AUTH_FILE: /run/secrets/jaybase_auth
+      # Optional. Empty keeps open writes. Set a writable data-volume path to
+      # enable the operator catalog, for example /var/lib/jaybase/catalog.json.
+      JAYBASE_CATALOG_FILE: ${JAYBASE_CATALOG_FILE:-}
       JAYBASE_SNAPSHOT_RETENTION: ${JAYBASE_SNAPSHOT_RETENTION:-24}
       JAYBASE_SNAPSHOT_MIN_FREE_BYTES: ${JAYBASE_SNAPSHOT_MIN_FREE_BYTES:-536870912}
       JAYBASE_MINIMUM_ROOT: ${JAYBASE_MINIMUM_ROOT:-}

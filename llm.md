@@ -10,9 +10,13 @@ It records who asserted something, when it was asserted, the command that caused
 the assertion, and an encrypted JSON payload. Its hash-linked history is the
 source of truth.
 
-Jaybase does not decide whether a fact is true, enforce a domain schema, or
-materialize current entity state. The consuming agent must validate evidence,
-apply its domain rules, and derive current state by replaying relevant events.
+Jaybase does not decide whether a fact is true or materialize current entity
+state. It does not enforce a domain schema unless an operator has installed a
+catalog. Installed types and commands are an exact list outside the event
+history. Tokens with no `allow` block keep role-wide access, except that an
+enforced catalog rejects types and commands that are not installed. The
+consuming agent must still validate evidence, apply its domain rules, and
+derive current state by replaying relevant events.
 
 Prefer the hosted HTTP API. Never read or edit Jaybase's `objects/`, `refs/`, or
 `keys/` files directly.
@@ -21,7 +25,11 @@ Prefer the hosted HTTP API. Never read or edit Jaybase's `objects/`, `refs/`, or
 
 - `JAYBASE_URL`: HTTPS origin, without a trailing slash.
 - `JAYBASE_TOKEN`: bearer token assigned to this agent.
-- Role: `reader`, `writer`, or `admin`. Roles are cumulative.
+- Role: `reader`, `writer`, `operator`, or `admin`. `reader`, `writer`, and
+  `admin` are cumulative. `operator` only manages the catalog and cannot read
+  or append facts. Use `operator` for the agent that installs types, and a
+  separate `writer` for the agent that appends them. Do not use `admin` for
+  either job.
 
 Never put a token in a URL, payload, log, source file, prompt transcript, or
 idempotency key. Send it only in the `Authorization` header. Use the lowest role
@@ -124,6 +132,15 @@ curl -fsS -X POST "$JAYBASE_URL/v1/events" \
 The server derives `actor`, `role`, `created_at`, parents, encryption fields, and
 hash. Do not include or attempt to override them.
 
+A token may carry an `allow` block. If it does, `type` must match
+`namespace.name` or `namespace.*` inside that one namespace, and `command` must
+be listed when the token lists commands. If `allow.refs` is set, named-ref
+updates must match an exact name or a prefix ending in `*`. A token without
+`allow` is not narrowed by this rule. When a catalog is enforced, the type and
+command must also be installed, including for unscoped writers. `403
+permission_denied` on a write means stop. Do not invent a new type or command
+and retry.
+
 Interpret a successful response as follows:
 
 - `201` and `replayed: false`: a new event was committed.
@@ -211,7 +228,9 @@ Errors have this structure:
 Handle codes deliberately:
 
 - `validation_error`: fix the request; do not retry unchanged.
-- `permission_denied`: stop and obtain the correct least-privilege credential.
+- `permission_denied`: stop. Do not retry with a different type, command, or
+  ref. The credential is outside its role, its `allow` block, or the installed
+  catalog. Installing a type is an operator action, not a writer retry.
 - `not_found`: refresh the root, cursor, or named-ref assumption.
 - `conflict`: follow the conflict algorithm above.
 - `integrity_error`: stop writes and alert an operator; stored data failed a

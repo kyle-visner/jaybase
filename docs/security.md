@@ -4,8 +4,11 @@
 
 - HTTPS protects credentials and payloads in transit.
 - Role-scoped bearer credentials separate read, write, and administrative work.
-  Only SHA-256 digests are stored in `auth.json`; optional RFC3339 `not_after`
-  values make credentials fail closed at their expiry boundary.
+  `reader`, `writer`, and `admin` stay cumulative. Optional `allow` patterns
+  narrow a token without changing tokens that omit them. Optional `operator`
+  credentials manage the catalog and cannot append. Only SHA-256 digests are
+  stored in `auth.json`; optional RFC3339 `not_after` values make credentials
+  fail closed at their expiry boundary.
 - AES-256-GCM protects payload confidentiality and authenticity on data and
   backup volumes. The external data key is excluded from hosted storage and
   snapshots.
@@ -33,9 +36,17 @@
 ## Single-tenant financial deployment profile
 
 Jaybase is intentionally one organization, one process, one volume, and one
-active data key. `reader`, `writer`, and `admin` are cumulative coarse roles;
-this is not multi-tenant isolation or per-customer authorization. Use separate
-deployments and keys when two parties must not trust the same admin.
+active data key. `reader`, `writer`, and `admin` are cumulative coarse roles.
+`operator` is a separate catalog role, not a second writer. This is not
+multi-tenant isolation or per-entity authorization. Use separate deployments
+and keys when two parties must not trust the same admin.
+
+Give an agent `operator` when it may install types, and a scoped `writer` when
+it may append. Do not give that schema agent `admin`: admin remains a superset
+and can still append installed types. An unenforced catalog changes nothing.
+Once a type is installed, unknown types and commands are rejected for every
+appender, and deleting the last type stays closed. Reopening arbitrary writes
+is a host command (`catalog enforce FILE false`), not an agent request.
 
 For financial data:
 
@@ -43,6 +54,7 @@ For financial data:
   in encrypted payloads;
 - use opaque random identifiers in metadata;
 - give ordinary agents expiring `reader` or `writer` tokens, never `admin`;
+  add `allow` when a writer must stay inside one namespace;
 - deliver the data key from a secret manager or KMS/HSM-backed workflow through
   the existing read-only key-file mount;
 - keep the key, snapshots, and root pins in separate failure domains; and

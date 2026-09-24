@@ -42,12 +42,14 @@ func main() {
 		err = addToken()
 	case "revoke-token":
 		err = revokeToken()
+	case "catalog":
+		err = catalogCommand()
 	case "migrate-key":
 		err = migrateKey()
 	case "init":
 		err = initSecrets()
 	default:
-		err = fmt.Errorf("unknown command %q (expected serve, healthcheck, hash-token, add-token, revoke-token, migrate-key, or init)", command)
+		err = fmt.Errorf("unknown command %q (expected serve, healthcheck, hash-token, add-token, revoke-token, catalog, migrate-key, or init)", command)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "jaybase-server:", err)
@@ -79,6 +81,13 @@ func serve() error {
 	if err != nil {
 		return err
 	}
+	var catalog *server.Catalog
+	if catalogFile := strings.TrimSpace(os.Getenv("JAYBASE_CATALOG_FILE")); catalogFile != "" {
+		catalog, err = server.LoadCatalog(catalogFile)
+		if err != nil {
+			return err
+		}
+	}
 	snapshotRetention, err := envInt("JAYBASE_SNAPSHOT_RETENTION", 24)
 	if err != nil {
 		return err
@@ -100,6 +109,7 @@ func serve() error {
 		SnapshotRetention: snapshotRetention, SnapshotMinFreeBytes: snapshotMinFreeBytes,
 		MinimumRoot:        strings.TrimSpace(os.Getenv("JAYBASE_MINIMUM_ROOT")),
 		RateLimitPerMinute: rateLimit, FailedAuthLimitPerMinute: failedAuthLimit,
+		Catalog: catalog,
 	})
 	if err != nil {
 		return err
@@ -198,27 +208,109 @@ func hashToken() error {
 }
 
 func addToken() error {
-	if len(os.Args) < 5 || len(os.Args) > 6 {
-		return fmt.Errorf("usage: jaybase-server add-token AUTH_FILE ID ROLE [NOT_AFTER_RFC3339]")
+	args := os.Args[2:]
+	if len(args) < 3 {
+		return fmt.Errorf("usage: jaybase-server add-token AUTH_FILE ID ROLE [NOT_AFTER_RFC3339] [--allow-type PATTERN]... [--allow-command COMMAND]... [--allow-ref PATTERN]...")
 	}
 	var notAfter *time.Time
-	if len(os.Args) == 6 {
-		parsed, err := time.Parse(time.RFC3339, os.Args[5])
+	rest := args[3:]
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "--") {
+		parsed, err := time.Parse(time.RFC3339, rest[0])
 		if err != nil {
 			return fmt.Errorf("NOT_AFTER must be RFC3339: %w", err)
 		}
 		notAfter = &parsed
+		rest = rest[1:]
+	}
+	allow, err := parseAllowFlags(rest)
+	if err != nil {
+		return err
 	}
 	token, err := randomToken()
 	if err != nil {
 		return err
 	}
-	if err := server.AddToken(os.Args[2], os.Args[3], os.Args[4], token, notAfter); err != nil {
+	if err := server.AddToken(args[0], args[1], args[2], token, notAfter, allow); err != nil {
 		return err
 	}
-	fmt.Printf("%s=%s\n", os.Args[3], token)
+	fmt.Printf("%s=%s\n", args[1], token)
 	fmt.Fprintln(os.Stderr, "Token added. Store the plaintext in a password manager, then recreate the service to load the updated auth file.")
 	return nil
+}
+
+func parseAllowFlags(args []string) (*server.Allow, error) {
+	if len(args) == 0 {
+		return nil, nil
+	}
+	allow := &server.Allow{}
+	for i := 0; i < len(args); i++ {
+		if i+1 >= len(args) {
+			return nil, fmt.Errorf("%s requires a value", args[i])
+		}
+		value := args[i+1]
+		switch args[i] {
+		case "--allow-type":
+			allow.Types = append(allow.Types, value)
+		case "--allow-command":
+			allow.Commands = append(allow.Commands, value)
+		case "--allow-ref":
+			allow.Refs = append(allow.Refs, value)
+		default:
+			return nil, fmt.Errorf("unknown argument %q", args[i])
+		}
+		i++
+	}
+	if len(allow.Types) == 0 && len(allow.Commands) == 0 && len(allow.Refs) == 0 {
+		return nil, nil
+	}
+	return allow, nil
+}
+
+func catalogCommand() error {
+	if len(os.Args) < 4 {
+		return fmt.Errorf("usage: jaybase-server catalog show|install|remove|enforce CATALOG_FILE ...")
+	}
+	catalog, err := server.LoadCatalog(os.Args[3])
+	if err != nil {
+		return err
+	}
+	switch os.Args[2] {
+	case "show":
+		if len(os.Args) != 4 {
+			return fmt.Errorf("usage: jaybase-server catalog show CATALOG_FILE")
+		}
+		return json.NewEncoder(os.Stdout).Encode(catalog.View())
+	case "install":
+		if len(os.Args) < 6 {
+			return fmt.Errorf("usage: jaybase-server catalog install CATALOG_FILE TYPE COMMAND...")
+		}
+		entry, _, err := catalog.Install(os.Args[4], os.Args[5:])
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "Catalog updated and enforcement is on. Recreate Jaybase if it was already running; the HTTP catalog API applies without a recreate.")
+		return json.NewEncoder(os.Stdout).Encode(entry)
+	case "remove":
+		if len(os.Args) != 5 {
+			return fmt.Errorf("usage: jaybase-server catalog remove CATALOG_FILE TYPE")
+		}
+		if err := catalog.Remove(os.Args[4]); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "Removed %s. Enforcement is unchanged. Recreate Jaybase if it was already running.\n", os.Args[4])
+		return nil
+	case "enforce":
+		if len(os.Args) != 5 || (os.Args[4] != "true" && os.Args[4] != "false") {
+			return fmt.Errorf("usage: jaybase-server catalog enforce CATALOG_FILE true|false")
+		}
+		if err := catalog.SetEnforced(os.Args[4] == "true"); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "Catalog enforced=%s. Recreate Jaybase if it was already running.\n", os.Args[4])
+		return nil
+	default:
+		return fmt.Errorf("unknown catalog command %q", os.Args[2])
+	}
 }
 
 func revokeToken() error {
