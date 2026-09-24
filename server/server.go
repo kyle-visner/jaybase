@@ -41,6 +41,10 @@ type Options struct {
 	// SnapshotMinFreeBytes is the reserve preserved after the estimated archive;
 	// zero explicitly disables the reserve.
 	SnapshotMinFreeBytes uint64
+	// Catalog is optional. Nil leaves appends open to any type, which is the
+	// historical behavior. A configured catalog enforces only after a type is
+	// installed or the host turns enforcement on.
+	Catalog *Catalog
 }
 
 type API struct {
@@ -52,6 +56,7 @@ type API struct {
 	snapshotRetention    int
 	snapshotMinFreeBytes uint64
 	minimumRoot          string
+	catalog              *Catalog
 	requestLimiter       *fixedWindowLimiter
 	failedAuthLimiter    *fixedWindowLimiter
 	availableBytes       func(string) (uint64, error)
@@ -89,6 +94,7 @@ func New(options Options) (*API, error) {
 		logger: options.Logger, maxBody: options.MaxBodyBytes,
 		snapshotRetention: options.SnapshotRetention, snapshotMinFreeBytes: options.SnapshotMinFreeBytes,
 		minimumRoot:       strings.TrimSpace(options.MinimumRoot),
+		catalog:           options.Catalog,
 		requestLimiter:    newFixedWindowLimiter(options.RateLimitPerMinute, time.Minute),
 		failedAuthLimiter: newFixedWindowLimiter(options.FailedAuthLimitPerMinute, time.Minute),
 		availableBytes:    diskAvailableBytes, pruneSnapshots: pruneSnapshots, mux: http.NewServeMux(),
@@ -113,6 +119,9 @@ func (a *API) routes() {
 	a.mux.Handle("POST /v1/admin/snapshots", a.require(RoleAdmin, http.HandlerFunc(a.snapshot)))
 	a.mux.Handle("POST /v1/admin/verify", a.require(RoleAdmin, http.HandlerFunc(a.verify)))
 	a.mux.Handle("GET /v1/admin/check-root", a.require(RoleAdmin, http.HandlerFunc(a.checkRoot)))
+	a.mux.Handle("GET /v1/admin/catalog", a.require(RoleOperator, http.HandlerFunc(a.getCatalog)))
+	a.mux.Handle("POST /v1/admin/catalog/entries", a.require(RoleOperator, http.HandlerFunc(a.installCatalogEntry)))
+	a.mux.Handle("DELETE /v1/admin/catalog/entries/{type}", a.require(RoleOperator, http.HandlerFunc(a.removeCatalogEntry)))
 }
 
 func (a *API) live(w http.ResponseWriter, _ *http.Request) {
@@ -178,12 +187,15 @@ func (a *API) appendEvent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "payload is required")
 		return
 	}
+	principal := principalFromContext(r.Context())
+	if !a.authorizeAppend(w, principal, request.Type, request.Command) {
+		return
+	}
 	canonical, err := json.Marshal(request)
 	if err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	principal := principalFromContext(r.Context())
 	requestIDSum := sha256.Sum256([]byte(principal.ID + "\x00" + requestKey))
 	requestHashSum := sha256.Sum256(canonical)
 	hash, replayed, err := a.store.AppendIdempotent(
@@ -386,6 +398,13 @@ func (a *API) getNamedRef(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) putNamedRef(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	setRefAudit(w, name)
+	principal := principalFromContext(r.Context())
+	if err := principal.Allow.authorizeRef(name); err != nil {
+		writeError(w, http.StatusForbidden, jaybase.ErrPermission, err.Error())
+		return
+	}
 	if !hasJSONContentType(r) {
 		writeError(w, http.StatusUnsupportedMediaType, jaybase.ErrValidation, "Content-Type must be application/json")
 		return
@@ -402,11 +421,11 @@ func (a *API) putNamedRef(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, jaybase.ErrValidation, "expected_root is required; use an empty string to create the ref")
 		return
 	}
-	if err := a.store.WriteNamedRefAt(r.PathValue("name"), request.Root, *request.ExpectedRoot); err != nil {
+	if err := a.store.WriteNamedRefAt(name, request.Root, *request.ExpectedRoot); err != nil {
 		writeAPIError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"name": r.PathValue("name"), "root": request.Root})
+	writeJSON(w, http.StatusOK, map[string]string{"name": name, "root": request.Root})
 }
 
 func (a *API) snapshot(w http.ResponseWriter, _ *http.Request) {
@@ -528,7 +547,7 @@ func (a *API) require(minimum Role, next http.Handler) http.Handler {
 			writeRateLimit(w)
 			return
 		}
-		if principal.Role < minimum {
+		if !roleSatisfies(principal.Role, minimum) {
 			writeError(w, http.StatusForbidden, jaybase.ErrPermission, "credential does not have permission for this operation")
 			return
 		}
@@ -641,6 +660,9 @@ type responseRecorder struct {
 	nodes        int
 	payloadsRead int
 	selectedIDs  []string
+	eventType    string
+	command      string
+	refName      string
 }
 
 func (r *responseRecorder) WriteHeader(status int) {
@@ -652,6 +674,19 @@ func setRequestPrincipal(w http.ResponseWriter, id, role string) {
 	if recorder, ok := w.(*responseRecorder); ok {
 		recorder.principalID = id
 		recorder.role = role
+	}
+}
+
+func setAppendAudit(w http.ResponseWriter, eventType, command string) {
+	if recorder, ok := w.(*responseRecorder); ok {
+		recorder.eventType = eventType
+		recorder.command = command
+	}
+}
+
+func setRefAudit(w http.ResponseWriter, name string) {
+	if recorder, ok := w.(*responseRecorder); ok {
+		recorder.refName = name
 	}
 }
 
@@ -704,6 +739,12 @@ func (a *API) accessLog(next http.Handler) http.Handler {
 		if recorder.operation == "payload_read" {
 			attributes = append(attributes, "selected_event_count", len(recorder.selectedIDs),
 				"selected_event_ids", recorder.selectedIDs)
+		}
+		if recorder.eventType != "" {
+			attributes = append(attributes, "event_type", recorder.eventType, "command", recorder.command)
+		}
+		if recorder.refName != "" {
+			attributes = append(attributes, "ref", recorder.refName)
 		}
 		a.logger.Info("request", attributes...)
 	})

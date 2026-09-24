@@ -53,7 +53,7 @@ func TestAddAndRevokeTokenUpdateAuthFileWithoutPlaintext(t *testing.T) {
 	if err := os.WriteFile(path, contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := AddToken(path, "duplicate-token", "reader", initial, nil); err == nil {
+	if err := AddToken(path, "duplicate-token", "reader", initial, nil, nil); err == nil {
 		t.Fatal("expected duplicate token digest to be rejected")
 	}
 	unchanged, err := os.ReadFile(path)
@@ -68,7 +68,7 @@ func TestAddAndRevokeTokenUpdateAuthFileWithoutPlaintext(t *testing.T) {
 	}
 	added := strings.Repeat("n", 64)
 	expires := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
-	if err := AddToken(path, "reader-agent", "reader", added, &expires); err != nil {
+	if err := AddToken(path, "reader-agent", "reader", added, &expires, nil); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := os.ReadFile(path)

@@ -111,6 +111,52 @@ command. Expiry is enforced without reload, while file changes
 need recreation. If a token enters a ticket, log, chat, prompt, or shell history,
 use this procedure immediately and audit that principal's earlier requests.
 
+Scope a writer without changing existing unscoped tokens:
+
+```sh
+go run ./cmd/jaybase-server add-token \
+  ./secrets/auth.json magpie-writer writer \
+  --allow-type 'magpie.*' --allow-command journal.post --allow-ref 'magpie-*'
+```
+
+`NOT_AFTER` still comes before any `--allow-*` flag. Omit `allow` and the new
+token has the same role-wide access as before. Recreate Jaybase to load it.
+
+## Catalog
+
+The catalog is optional and is not part of the event history. Leave
+`JAYBASE_CATALOG_FILE` unset to keep open writes. Point it at a writable file
+on the data volume, not at the read-only auth secret:
+
+```sh
+# in the environment of the running service
+JAYBASE_CATALOG_FILE=/var/lib/jaybase/catalog.json
+```
+
+An operator token can install a type over HTTP. That turns enforcement on
+immediately and does not append an event:
+
+```sh
+curl -fsS -X POST "$JAYBASE_URL/v1/admin/catalog/entries" \
+  -H "Authorization: Bearer $JAYBASE_OPERATOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"type":"magpie.journal","commands":["journal.post"]}'
+```
+
+The same file can be edited from the host. A running process keeps the catalog
+it loaded until recreate, unless the change came through the HTTP API:
+
+```sh
+go run ./cmd/jaybase-server catalog install \
+  /var/lib/jaybase/catalog.json magpie.journal journal.post
+go run ./cmd/jaybase-server catalog show /var/lib/jaybase/catalog.json
+go run ./cmd/jaybase-server catalog enforce /var/lib/jaybase/catalog.json false
+```
+
+`enforce false` is the host-only way back to open writes. Agents cannot call
+it. After the first install, appends of types or commands that are not listed
+fail with `403` for writers and for admin.
+
 ## Data-key migration after compromise
 
 Migration is offline and writes a new store; it never edits the source. New

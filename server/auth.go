@@ -20,6 +20,9 @@ const (
 	RoleReader Role = iota + 1
 	RoleWriter
 	RoleAdmin
+	// RoleOperator manages the catalog only. It is not on the cumulative
+	// reader/writer/admin ladder and cannot append facts.
+	RoleOperator
 )
 
 func (r Role) String() string {
@@ -30,6 +33,8 @@ func (r Role) String() string {
 		return "writer"
 	case RoleAdmin:
 		return "admin"
+	case RoleOperator:
+		return "operator"
 	default:
 		return "unknown"
 	}
@@ -43,14 +48,17 @@ func parseRole(raw string) (Role, error) {
 		return RoleWriter, nil
 	case "admin":
 		return RoleAdmin, nil
+	case "operator":
+		return RoleOperator, nil
 	default:
-		return 0, fmt.Errorf("role must be reader, writer, or admin")
+		return 0, fmt.Errorf("role must be reader, writer, admin, or operator")
 	}
 }
 
 type Principal struct {
-	ID   string
-	Role Role
+	ID    string
+	Role  Role
+	Allow *Allow
 }
 
 type credentialFile struct {
@@ -62,6 +70,7 @@ type credentialRecord struct {
 	Role     string     `json:"role"`
 	SHA256   string     `json:"sha256"`
 	NotAfter *time.Time `json:"not_after,omitempty"`
+	Allow    *Allow     `json:"allow,omitempty"`
 }
 
 type credential struct {
@@ -109,6 +118,9 @@ func LoadAuthenticator(path string) (*Authenticator, error) {
 		if err != nil {
 			return nil, fmt.Errorf("tokens[%d]: %w", i, err)
 		}
+		if err := validateAllow(record.Allow); err != nil {
+			return nil, fmt.Errorf("tokens[%d]: %w", i, err)
+		}
 		digest, err := hex.DecodeString(strings.TrimSpace(record.SHA256))
 		if err != nil || len(digest) != sha256.Size {
 			return nil, fmt.Errorf("tokens[%d].sha256 must be a 64-character SHA-256 hex digest", i)
@@ -124,7 +136,7 @@ func LoadAuthenticator(path string) (*Authenticator, error) {
 			record.NotAfter = &notAfter
 		}
 		auth.credentials = append(auth.credentials, credential{
-			principal: Principal{ID: record.ID, Role: role},
+			principal: Principal{ID: record.ID, Role: role, Allow: record.Allow},
 			digest:    fixed,
 			notAfter:  record.NotAfter,
 		})
@@ -171,8 +183,9 @@ func (a *Authenticator) Authenticate(token string) (Principal, bool) {
 }
 
 // AddToken adds a generated token digest to an auth file. The plaintext token
-// is supplied by the caller and is never written to disk.
-func AddToken(path, id, role, token string, notAfter *time.Time) error {
+// is supplied by the caller and is never written to disk. A nil allow preserves
+// role-wide access.
+func AddToken(path, id, role, token string, notAfter *time.Time, allow *Allow) error {
 	if _, err := LoadAuthenticator(path); err != nil {
 		return err
 	}
@@ -194,6 +207,9 @@ func AddToken(path, id, role, token string, notAfter *time.Time) error {
 	if notAfter != nil && !notAfter.After(time.Now().UTC()) {
 		return fmt.Errorf("not_after must be in the future")
 	}
+	if err := validateAllow(allow); err != nil {
+		return err
+	}
 	for _, record := range file.Tokens {
 		if strings.TrimSpace(record.ID) == id {
 			return fmt.Errorf("credential id %q already exists", id)
@@ -211,7 +227,7 @@ func AddToken(path, id, role, token string, notAfter *time.Time) error {
 		notAfter = &value
 	}
 	file.Tokens = append(file.Tokens, credentialRecord{
-		ID: id, Role: parsedRole.String(), SHA256: digest, NotAfter: notAfter,
+		ID: id, Role: parsedRole.String(), SHA256: digest, NotAfter: notAfter, Allow: allow,
 	})
 	return writeCredentialFile(path, file)
 }
